@@ -8,7 +8,7 @@
 - Подробно определены состав MVP и сценарии проверки для GitHub и VPS.
 - Создан локальный Git-репозиторий с веткой `main`.
 - Создан публичный репозиторий [MostViable/obsidian-own-sync](https://github.com/MostViable/obsidian-own-sync), добавлен `origin`, принята лицензия MIT.
-- Заведены [issues #1–#4](https://github.com/MostViable/obsidian-own-sync/issues) для технических проверок первого этапа.
+- Заведены [issues #1–#9](https://github.com/MostViable/obsidian-own-sync/issues) для технических проверок и вопроса по правилам публикации.
 - Сверены действующие правила публикации в каталоге Obsidian; выводы и проверки записаны в [OBSIDIAN_PUBLICATION.md](OBSIDIAN_PUBLICATION.md).
 - Первый публичный релиз переопределён как близкий по возможностям к Obsidian Sync, включая общие vault. VPS шифрует данные до отправки, GitHub хранит читаемый Markdown; состав и ограничения записаны в [RELEASE_V1.md](RELEASE_V1.md).
 
@@ -18,9 +18,9 @@
 
 ## Следующие действия
 
-1. Выполнить проверки из issues #1–#4 и дополнить проект формата требованиями истории, общих vault и шифрования VPS.
+1. Выполнить проверки из issues #1–#8; формат, история, общие vault и шифрование VPS проектируются до реализации сервера.
 2. Реализовать технический MVP, затем функции [первого публичного релиза](RELEASE_V1.md).
-3. Перед выпуском проверить реализацию по [правилам публикации](OBSIDIAN_PUBLICATION.md).
+3. До публичного релиза закрыть [вопрос по правилам Obsidian](https://github.com/MostViable/obsidian-own-sync/issues/9) и проверить реализацию по [правилам публикации](OBSIDIAN_PUBLICATION.md).
 
 ## Доступ GitHub
 
