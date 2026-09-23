@@ -1,0 +1,19 @@
+# Plugin and server build output
+node_modules/
+dist/
+target/
+coverage/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
