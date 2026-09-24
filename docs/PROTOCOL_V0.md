@@ -14,9 +14,12 @@
 | Метод и путь | Назначение |
 | --- | --- |
 | `GET /healthz` | Доступность сервера; работает без экспериментального API. |
+| `GET /api/v0/capabilities` | Версия протокола, версия пакета и максимальный размер тела; не требует токена. |
 | `GET /api/v0/vaults/{vault_id}/head` | Текущая ревизия: `{ "current_revision": 1 }`. Нужна роль `reader` или выше. |
 | `GET /api/v0/vaults/{vault_id}/commits/{revision}` | Пакет указанной ревизии как `application/octet-stream`. Нужна роль `reader` или выше. |
 | `POST /api/v0/vaults/{vault_id}/operations/{operation_id}` | Запись пакета с `X-Expected-Revision`. Нужна роль `writer` или `owner`. Тело ограничено 1 МиБ. |
+
+Ответ capabilities имеет вид `{ "protocol_version": 0, "packet_format_version": 1, "max_packet_bytes": 1048576 }`. Клиент обязан остановиться с понятной ошибкой, если версия протокола или пакета неизвестна либо сервер объявляет меньший лимит.
 
 Новая запись возвращает `201` и `{ "result": "applied", "revision": N }`; повтор тех же байтов с тем же ID — `200` и `replayed`. Устаревшая ожидаемая ревизия возвращает `409` и `{ "result": "conflict", "current_revision": N }`, ничего не записывая. Повтор ID с изменёнными байтами возвращает `409` и `operation_id_reused`. Ошибки формата дают `400`, отсутствие прав — `401`, неизвестная ревизия — `404`, слишком большой пакет — `413`. Ответы API указывают `Cache-Control: no-store`.
 

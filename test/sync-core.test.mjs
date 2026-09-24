@@ -2,11 +2,27 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { applyInitialSnapshot, applyRemoteChanges } from '../src/sync/apply.ts';
+import { assertCompatibleCapabilities } from '../src/sync/capabilities.ts';
 import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from '../src/sync/plan.ts';
 import { applyPacketToDigests, classifyUploadResponse, createPendingDownload, createPendingUpload, decodePacket, digestBytes, encodePacket, readPendingDownload, readPendingUpload, validateSyncPath } from '../src/sync/packet.ts';
 import { advanceConfirmedRevision, assertRebaseLocalFiles, changesFromLocal, confirmedAfterInitialDownload, confirmedAfterPull, confirmedAfterUpload, createPendingPull, planFromConfirmed, queuedUploadDigests, readConfirmedState, readPendingPull } from '../src/sync/state.ts';
 
 const map = (entries) => new Map(entries);
+
+test('rejects incompatible server capabilities before sync', () => {
+  assert.doesNotThrow(() => assertCompatibleCapabilities({
+    protocol_version: 0, packet_format_version: 1, max_packet_bytes: 1024 * 1024,
+  }));
+  assert.throws(() => assertCompatibleCapabilities({
+    protocol_version: 1, packet_format_version: 1, max_packet_bytes: 1024 * 1024,
+  }));
+  assert.throws(() => assertCompatibleCapabilities({
+    protocol_version: 0, packet_format_version: 2, max_packet_bytes: 1024 * 1024,
+  }));
+  assert.throws(() => assertCompatibleCapabilities({
+    protocol_version: 0, packet_format_version: 1, max_packet_bytes: 1024,
+  }));
+});
 
 test('plans independent offline changes without conflict', () => {
   assert.deepEqual(planSync(map([['a.md', 'a0'], ['b.md', 'b0']]),
