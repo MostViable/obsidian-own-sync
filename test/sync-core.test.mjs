@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { assertNoCaseCollisions, planSync } from '../src/sync/plan.ts';
-import { applyPacketToDigests, decodePacket, digestBytes, encodePacket, validateSyncPath } from '../src/sync/packet.ts';
+import { applyPacketToDigests, createPendingUpload, decodePacket, digestBytes, encodePacket, readPendingUpload, validateSyncPath } from '../src/sync/packet.ts';
 
 const map = (entries) => new Map(entries);
 
@@ -99,4 +99,13 @@ test('rejects unsupported versions, extra fields and oversized packets', async (
   await assert.rejects(encodePacket([
     { path: 'large.bin', kind: 'put', bytes: new Uint8Array(800_000) },
   ]));
+});
+
+test('persists exact packet bytes and operation ID for retry', async () => {
+  const packet = await encodePacket([{ path: 'test.md', kind: 'put', bytes: new Uint8Array([1, 2]) }]);
+  const pending = createPendingUpload('https://sync.example.com', 'a'.repeat(32), packet);
+  const restored = await readPendingUpload(JSON.parse(JSON.stringify(pending)));
+  assert.equal(restored.pending.operationId, pending.operationId);
+  assert.deepEqual(new Uint8Array(restored.body), packet);
+  await assert.rejects(readPendingUpload({ ...pending, packetText: pending.packetText.replace('test.md', '../test.md') }));
 });

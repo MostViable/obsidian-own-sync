@@ -1,5 +1,13 @@
 export const MAX_PACKET_BYTES = 1024 * 1024;
 
+export interface PendingUpload {
+  formatVersion: 1;
+  serverUrl: string;
+  vaultId: string;
+  operationId: string;
+  packetText: string;
+}
+
 export type FileChange =
   | { path: string; kind: 'put'; bytes: Uint8Array }
   | { path: string; kind: 'delete' };
@@ -143,4 +151,32 @@ export async function applyPacketToDigests(state: Map<string, string>, packet: A
     if (update.digest === undefined) state.delete(update.path);
     else state.set(update.path, update.digest);
   }
+}
+
+export function createPendingUpload(serverUrl: string, vaultId: string, packet: Uint8Array): PendingUpload {
+  const id = new Uint8Array(16);
+  crypto.getRandomValues(id);
+  return {
+    formatVersion: 1,
+    serverUrl,
+    vaultId,
+    operationId: [...id].map((part) => part.toString(16).padStart(2, '0')).join(''),
+    packetText: textDecoder.decode(packet),
+  };
+}
+
+export async function readPendingUpload(value: unknown): Promise<{ pending: PendingUpload; body: ArrayBuffer }> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Invalid pending upload.');
+  }
+  const candidate = value as Record<string, unknown>;
+  if (candidate.formatVersion !== 1 || typeof candidate.serverUrl !== 'string' ||
+    typeof candidate.vaultId !== 'string' || !/^[0-9a-f]{32}$/i.test(candidate.vaultId) ||
+    typeof candidate.operationId !== 'string' || !/^[0-9a-f]{32}$/i.test(candidate.operationId) ||
+    typeof candidate.packetText !== 'string' || Object.keys(candidate).length !== 5) {
+    throw new Error('Invalid pending upload.');
+  }
+  const body = textEncoder.encode(candidate.packetText).buffer;
+  await decodePacket(body);
+  return { pending: candidate as unknown as PendingUpload, body };
 }

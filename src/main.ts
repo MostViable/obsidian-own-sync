@@ -1,7 +1,7 @@
 import { App, Notice, Plugin, PluginSettingTab, requestUrl, SecretComponent, Setting } from 'obsidian';
 
 import { assertNoCaseCollisions, planSync } from './sync/plan';
-import { applyPacketToDigests, digestBytes, validateSyncPath } from './sync/packet';
+import { applyPacketToDigests, createPendingUpload, digestBytes, encodePacket, MAX_PACKET_BYTES, readPendingUpload, validateSyncPath } from './sync/packet';
 
 const MAX_PREVIEW_REVISIONS = 100;
 const MAX_PREVIEW_BYTES = 32 * 1024 * 1024;
@@ -38,14 +38,18 @@ function serverBaseUrl(serverUrl: string): string {
 
 export default class OwnSyncPlugin extends Plugin {
   settings: OwnSyncSettings = DEFAULT_SETTINGS;
+  private pendingUpload: unknown = null;
+  private uploadRunning = false;
+  private saveChain: Promise<void> = Promise.resolve();
 
   async onload(): Promise<void> {
-    const saved = await this.loadData() as Partial<OwnSyncSettings> | null;
+    const saved = await this.loadData() as (Partial<OwnSyncSettings> & { pendingUpload?: unknown }) | null;
     this.settings = {
       serverUrl: typeof saved?.serverUrl === 'string' ? saved.serverUrl : '',
       vaultId: typeof saved?.vaultId === 'string' ? saved.vaultId : '',
       tokenSecretId: typeof saved?.tokenSecretId === 'string' ? saved.tokenSecretId : '',
     };
+    this.pendingUpload = saved?.pendingUpload ?? null;
 
     this.addSettingTab(new OwnSyncSettingTab(this.app, this));
     this.addCommand({
@@ -63,10 +67,17 @@ export default class OwnSyncPlugin extends Plugin {
       name: 'Preview first sync',
       callback: () => { void this.previewFirstSync(); },
     });
+    this.addCommand({
+      id: 'upload-test-vault',
+      name: 'Upload test vault to empty server',
+      callback: () => { void this.uploadTestVault(); },
+    });
   }
 
   async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
+    const snapshot = { ...this.settings, pendingUpload: this.pendingUpload };
+    this.saveChain = this.saveChain.catch(() => {}).then(() => this.saveData(snapshot));
+    await this.saveChain;
   }
 
   async checkServerConnection(): Promise<void> {
@@ -203,6 +214,103 @@ export default class OwnSyncPlugin extends Plugin {
         : 'Own Sync: preview failed or contains unsupported data. No files changed.');
     }
   }
+
+  async uploadTestVault(): Promise<void> {
+    if (this.uploadRunning) return;
+    this.uploadRunning = true;
+    try {
+      await this.uploadTestVaultOnce();
+    } finally {
+      this.uploadRunning = false;
+    }
+  }
+
+  private async uploadTestVaultOnce(): Promise<void> {
+    let connection: { baseUrl: string; vaultId: string; token: string };
+    try {
+      connection = this.vaultConnection();
+    } catch (error) {
+      new Notice(`Own Sync: ${(error as Error).message}`);
+      return;
+    }
+    const vaultId = connection.vaultId.toLowerCase();
+    const endpoint = `${connection.baseUrl}/api/v0/vaults/${vaultId}`;
+    if (this.pendingUpload === null) {
+      try {
+        const head = await requestUrl({
+          url: `${endpoint}/head`, method: 'GET',
+          headers: { Authorization: `Bearer ${connection.token}` }, throw: false,
+        });
+        if (head.status !== 200 || head.json?.current_revision !== 0) {
+          new Notice('Own Sync: test upload needs an accessible empty server vault. No files sent.');
+          return;
+        }
+        const files = this.app.vault.getFiles();
+        if (files.length === 0) {
+          new Notice('Own Sync: test vault has no visible files to upload.');
+          return;
+        }
+        for (const file of files) validateSyncPath(file.path);
+        assertNoCaseCollisions(files.map((file) => file.path));
+        let totalBytes = 0;
+        const changes: Array<{ path: string; kind: 'put'; bytes: Uint8Array }> = [];
+        for (const file of files) {
+          totalBytes += file.stat.size;
+          if (totalBytes > MAX_PACKET_BYTES) {
+            new Notice('Own Sync: test upload exceeds the 1 MiB packet limit. No files sent.');
+            return;
+          }
+          changes.push({ path: file.path, kind: 'put', bytes: new Uint8Array(await this.app.vault.readBinary(file)) });
+        }
+        const packet = await encodePacket(changes);
+        this.pendingUpload = createPendingUpload(connection.baseUrl, vaultId, packet);
+        try {
+          await this.saveSettings();
+        } catch {
+          this.pendingUpload = null;
+          throw new Error('Could not persist pending upload.');
+        }
+      } catch {
+        new Notice('Own Sync: could not prepare or save test upload. No files sent.');
+        return;
+      }
+    }
+
+    try {
+      const { pending, body } = await readPendingUpload(this.pendingUpload);
+      if (pending.serverUrl !== connection.baseUrl || pending.vaultId !== vaultId) {
+        new Notice('Own Sync: pending upload belongs to another server or vault. Restore its settings before retrying.');
+        return;
+      }
+      const response = await requestUrl({
+        url: `${endpoint}/operations/${pending.operationId}`,
+        method: 'POST',
+        contentType: 'application/octet-stream',
+        headers: {
+          Authorization: `Bearer ${connection.token}`,
+          'X-Expected-Revision': '0',
+        },
+        body,
+        throw: false,
+      });
+      if ((response.status === 201 && response.json?.result === 'applied' ||
+        response.status === 200 && response.json?.result === 'replayed') &&
+        response.json?.revision === 1) {
+        this.pendingUpload = null;
+        try {
+          await this.saveSettings();
+          new Notice('Own Sync: test vault uploaded as revision 1. Files on this device were not changed.');
+        } catch {
+          this.pendingUpload = pending;
+          new Notice('Own Sync: server accepted the upload, but local confirmation could not be saved. Retry is safe.');
+        }
+      } else {
+        new Notice(`Own Sync: server did not accept test upload (HTTP ${response.status}). Pending operation kept.`);
+      }
+    } catch {
+      new Notice('Own Sync: upload result unknown. Pending operation kept for an identical retry.');
+    }
+  }
 }
 
 class OwnSyncSettingTab extends PluginSettingTab {
@@ -271,6 +379,15 @@ class OwnSyncSettingTab extends PluginSettingTab {
         .setButtonText('Preview first sync')
         .onClick(async () => {
           await this.plugin.previewFirstSync();
+        }));
+
+    new Setting(containerEl)
+      .setName('Test upload')
+      .setDesc('Send all visible files as one unencrypted packet only if the server vault is empty. For disposable test data. A failed request keeps the exact packet for retry.')
+      .addButton((button) => button
+        .setButtonText('Upload test vault')
+        .onClick(async () => {
+          await this.plugin.uploadTestVault();
         }));
   }
 }
