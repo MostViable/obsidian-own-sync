@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 axum = "0.8.9"
+getrandom = "0.4.3"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.11.0"

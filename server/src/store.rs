@@ -3,6 +3,7 @@ use std::{error::Error, fmt, path::Path, time::Duration};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
+use crate::access::{DeviceId, DeviceToken, UserId, VaultRole};
 use crate::revision::{
     decide_commit, AppliedCommit, CommitDecision, CommitRequest, OperationId, PayloadDigest,
     MAX_REVISION,
@@ -14,7 +15,11 @@ pub struct VaultId(pub [u8; 16]);
 #[derive(Debug)]
 pub enum StoreError {
     Database(rusqlite::Error),
+    Random(getrandom::Error),
     UnknownVault,
+    Unauthorized,
+    LastOwner,
+    LegacyVaultsNeedOwner,
     UnsupportedSchema(i64),
     UnsupportedJournalMode(String),
     InconsistentState,
@@ -24,7 +29,16 @@ impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Database(error) => write!(formatter, "SQLite error: {error}"),
+            Self::Random(error) => write!(formatter, "system random source failed: {error}"),
             Self::UnknownVault => write!(formatter, "vault does not exist"),
+            Self::Unauthorized => write!(formatter, "device has no access to this vault"),
+            Self::LastOwner => write!(formatter, "cannot remove the last vault owner"),
+            Self::LegacyVaultsNeedOwner => {
+                write!(
+                    formatter,
+                    "legacy vaults need an owner before schema migration"
+                )
+            }
             Self::UnsupportedSchema(version) => {
                 write!(formatter, "unsupported database schema version: {version}")
             }
@@ -40,6 +54,7 @@ impl Error for StoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Database(error) => Some(error),
+            Self::Random(error) => Some(error),
             _ => None,
         }
     }
@@ -48,6 +63,12 @@ impl Error for StoreError {
 impl From<rusqlite::Error> for StoreError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Database(error)
+    }
+}
+
+impl From<getrandom::Error> for StoreError {
+    fn from(error: getrandom::Error) -> Self {
+        Self::Random(error)
     }
 }
 
@@ -74,7 +95,130 @@ impl SqliteStore {
         Ok(Self { connection })
     }
 
-    pub fn create_vault(&self, vault_id: VaultId) -> Result<(), StoreError> {
+    pub fn create_user(&self) -> Result<UserId, StoreError> {
+        let user_id = UserId(random_id()?);
+        self.connection.execute(
+            "INSERT INTO users (user_id) VALUES (?1)",
+            params![&user_id.0[..]],
+        )?;
+        Ok(user_id)
+    }
+
+    /// Device provisioning is internal until the pairing and invitation flow exists.
+    pub fn issue_device(&self, user_id: UserId) -> Result<(DeviceId, DeviceToken), StoreError> {
+        let device_id = DeviceId(random_id()?);
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes)?;
+        let token = DeviceToken(bytes);
+        self.connection.execute(
+            "INSERT INTO devices (device_id, user_id, token_hash)
+             VALUES (?1, ?2, ?3)",
+            params![&device_id.0[..], &user_id.0[..], &token.digest()[..]],
+        )?;
+        Ok((device_id, token))
+    }
+
+    pub fn create_vault_for_owner(&mut self, owner: UserId) -> Result<VaultId, StoreError> {
+        let vault_id = VaultId(random_id()?);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO vaults (vault_id, current_revision) VALUES (?1, 0)",
+            params![&vault_id.0[..]],
+        )?;
+        transaction.execute(
+            "INSERT INTO vault_members (vault_id, user_id, role) VALUES (?1, ?2, 'owner')",
+            params![&vault_id.0[..], &owner.0[..]],
+        )?;
+        transaction.commit()?;
+        Ok(vault_id)
+    }
+
+    pub fn grant_member(
+        &mut self,
+        owner_token: &DeviceToken,
+        vault_id: VaultId,
+        user_id: UserId,
+        role: VaultRole,
+    ) -> Result<(), StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        authorize(&transaction, owner_token, vault_id, RequiredRole::Owner)?;
+        let previous_role: Option<String> = transaction
+            .query_row(
+                "SELECT role FROM vault_members WHERE vault_id = ?1 AND user_id = ?2",
+                params![&vault_id.0[..], &user_id.0[..]],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if previous_role.as_deref() == Some("owner") && role != VaultRole::Owner {
+            ensure_another_owner(&transaction, vault_id)?;
+        }
+        transaction.execute(
+            "INSERT INTO vault_members (vault_id, user_id, role) VALUES (?1, ?2, ?3)
+             ON CONFLICT(vault_id, user_id) DO UPDATE SET role = excluded.role",
+            params![&vault_id.0[..], &user_id.0[..], role.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn revoke_member(
+        &mut self,
+        owner_token: &DeviceToken,
+        vault_id: VaultId,
+        user_id: UserId,
+    ) -> Result<bool, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        authorize(&transaction, owner_token, vault_id, RequiredRole::Owner)?;
+        let role: Option<String> = transaction
+            .query_row(
+                "SELECT role FROM vault_members WHERE vault_id = ?1 AND user_id = ?2",
+                params![&vault_id.0[..], &user_id.0[..]],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if role.as_deref() == Some("owner") {
+            ensure_another_owner(&transaction, vault_id)?;
+        }
+        let removed = transaction.execute(
+            "DELETE FROM vault_members WHERE vault_id = ?1 AND user_id = ?2",
+            params![&vault_id.0[..], &user_id.0[..]],
+        )?;
+        transaction.commit()?;
+        Ok(removed == 1)
+    }
+
+    pub fn revoke_device(
+        &mut self,
+        active_token: &DeviceToken,
+        device_id: DeviceId,
+    ) -> Result<bool, StoreError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let user_id: Vec<u8> = transaction
+            .query_row(
+                "SELECT user_id FROM devices WHERE token_hash = ?1 AND revoked = 0",
+                params![&active_token.digest()[..]],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::Unauthorized)?;
+        let revoked = transaction.execute(
+            "UPDATE devices SET revoked = 1 WHERE device_id = ?1 AND user_id = ?2 AND revoked = 0",
+            params![&device_id.0[..], user_id],
+        )?;
+        transaction.commit()?;
+        Ok(revoked == 1)
+    }
+
+    #[cfg(test)]
+    fn create_vault(&self, vault_id: VaultId) -> Result<(), StoreError> {
         self.connection.execute(
             "INSERT INTO vaults (vault_id, current_revision) VALUES (?1, 0)",
             params![&vault_id.0[..]],
@@ -82,26 +226,70 @@ impl SqliteStore {
         Ok(())
     }
 
-    pub fn current_revision(&self, vault_id: VaultId) -> Result<Option<u64>, StoreError> {
-        let revision: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT current_revision FROM vaults WHERE vault_id = ?1",
-                params![&vault_id.0[..]],
-                |row| row.get(0),
-            )
-            .optional()?;
-        revision.map(valid_revision).transpose()
+    pub fn current_revision_for(
+        &mut self,
+        token: &DeviceToken,
+        vault_id: VaultId,
+    ) -> Result<u64, StoreError> {
+        let transaction = self.connection.transaction()?;
+        authorize(&transaction, token, vault_id, RequiredRole::Reader)?;
+        let revision =
+            read_current_revision(&transaction, vault_id)?.ok_or(StoreError::InconsistentState)?;
+        transaction.commit()?;
+        Ok(revision)
     }
 
-    /// Stores an already encrypted packet. Authorization and encryption belong to the caller.
-    pub fn commit(
+    #[cfg(test)]
+    fn current_revision(&self, vault_id: VaultId) -> Result<Option<u64>, StoreError> {
+        read_current_revision(&self.connection, vault_id)
+    }
+
+    /// Stores an already encrypted packet after checking the device's write access.
+    pub fn commit_authenticated(
+        &mut self,
+        token: &DeviceToken,
+        vault_id: VaultId,
+        operation_id: OperationId,
+        expected_revision: u64,
+        encrypted_payload: &[u8],
+    ) -> Result<CommitDecision, StoreError> {
+        self.commit_inner(
+            Some(token),
+            vault_id,
+            operation_id,
+            expected_revision,
+            encrypted_payload,
+        )
+    }
+
+    #[cfg(test)]
+    fn commit(
         &mut self,
         vault_id: VaultId,
         operation_id: OperationId,
         expected_revision: u64,
         encrypted_payload: &[u8],
     ) -> Result<CommitDecision, StoreError> {
+        self.commit_inner(
+            None,
+            vault_id,
+            operation_id,
+            expected_revision,
+            encrypted_payload,
+        )
+    }
+
+    fn commit_inner(
+        &mut self,
+        token: Option<&DeviceToken>,
+        vault_id: VaultId,
+        operation_id: OperationId,
+        expected_revision: u64,
+        encrypted_payload: &[u8],
+    ) -> Result<CommitDecision, StoreError> {
+        if let Some(token) = token {
+            authorize(&self.connection, token, vault_id, RequiredRole::Writer)?;
+        }
         if expected_revision > MAX_REVISION {
             return Ok(CommitDecision::InvalidRevision);
         }
@@ -116,6 +304,9 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(token) = token {
+            authorize(&transaction, token, vault_id, RequiredRole::Writer)?;
+        }
         let current: Option<i64> = transaction
             .query_row(
                 "SELECT current_revision FROM vaults WHERE vault_id = ?1",
@@ -178,32 +369,120 @@ impl SqliteStore {
         Ok(decision)
     }
 
-    pub fn encrypted_payload(
+    pub fn encrypted_payload_for(
+        &mut self,
+        token: &DeviceToken,
+        vault_id: VaultId,
+        revision: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let transaction = self.connection.transaction()?;
+        authorize(&transaction, token, vault_id, RequiredRole::Reader)?;
+        let payload = read_encrypted_payload(&transaction, vault_id, revision)?;
+        transaction.commit()?;
+        Ok(payload)
+    }
+
+    #[cfg(test)]
+    fn encrypted_payload(
         &self,
         vault_id: VaultId,
         revision: u64,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        if revision == 0 || revision > MAX_REVISION {
-            return Ok(None);
-        }
-        let stored: Option<(Vec<u8>, Vec<u8>)> = self
-            .connection
-            .query_row(
-                "SELECT payload_digest, encrypted_payload FROM commits
-                 WHERE vault_id = ?1 AND applied_revision = ?2",
-                params![&vault_id.0[..], revision as i64],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        stored
-            .map(|(stored_digest, payload)| {
-                if stored_digest.as_slice() != digest(&payload).0 {
-                    return Err(StoreError::InconsistentState);
-                }
-                Ok(payload)
-            })
-            .transpose()
+        read_encrypted_payload(&self.connection, vault_id, revision)
     }
+}
+
+fn read_encrypted_payload(
+    connection: &Connection,
+    vault_id: VaultId,
+    revision: u64,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    if revision == 0 || revision > MAX_REVISION {
+        return Ok(None);
+    }
+    let stored: Option<(Vec<u8>, Vec<u8>)> = connection
+        .query_row(
+            "SELECT payload_digest, encrypted_payload FROM commits
+                 WHERE vault_id = ?1 AND applied_revision = ?2",
+            params![&vault_id.0[..], revision as i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    stored
+        .map(|(stored_digest, payload)| {
+            if stored_digest.as_slice() != digest(&payload).0 {
+                return Err(StoreError::InconsistentState);
+            }
+            Ok(payload)
+        })
+        .transpose()
+}
+
+fn read_current_revision(
+    connection: &Connection,
+    vault_id: VaultId,
+) -> Result<Option<u64>, StoreError> {
+    let revision: Option<i64> = connection
+        .query_row(
+            "SELECT current_revision FROM vaults WHERE vault_id = ?1",
+            params![&vault_id.0[..]],
+            |row| row.get(0),
+        )
+        .optional()?;
+    revision.map(valid_revision).transpose()
+}
+
+enum RequiredRole {
+    Reader,
+    Writer,
+    Owner,
+}
+
+fn ensure_another_owner(connection: &Connection, vault_id: VaultId) -> Result<(), StoreError> {
+    let owners: i64 = connection.query_row(
+        "SELECT count(*) FROM vault_members WHERE vault_id = ?1 AND role = 'owner'",
+        params![&vault_id.0[..]],
+        |row| row.get(0),
+    )?;
+    if owners <= 1 {
+        return Err(StoreError::LastOwner);
+    }
+    Ok(())
+}
+
+fn authorize(
+    connection: &Connection,
+    token: &DeviceToken,
+    vault_id: VaultId,
+    required: RequiredRole,
+) -> Result<(), StoreError> {
+    let role: Option<String> = connection
+        .query_row(
+            "SELECT members.role FROM devices
+             JOIN vault_members AS members ON members.user_id = devices.user_id
+             WHERE devices.token_hash = ?1 AND devices.revoked = 0
+               AND members.vault_id = ?2",
+            params![&token.digest()[..], &vault_id.0[..]],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let role = role.ok_or(StoreError::Unauthorized)?;
+    let role = VaultRole::from_str(&role).ok_or(StoreError::InconsistentState)?;
+    let allowed = match required {
+        RequiredRole::Reader => true,
+        RequiredRole::Writer => role.can_write(),
+        RequiredRole::Owner => role == VaultRole::Owner,
+    };
+    if !allowed {
+        return Err(StoreError::Unauthorized);
+    }
+    Ok(())
+}
+
+fn random_id() -> Result<[u8; 16], StoreError> {
+    let mut bytes = [0_u8; 16];
+    getrandom::fill(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn valid_revision(value: i64) -> Result<u64, StoreError> {
@@ -234,29 +513,21 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
             if existing_tables != 0 {
                 return Err(StoreError::UnsupportedSchema(0));
             }
-            transaction.execute_batch(
-                "CREATE TABLE vaults (
-                     vault_id BLOB NOT NULL PRIMARY KEY CHECK(length(vault_id) = 16),
-                     current_revision INTEGER NOT NULL DEFAULT 0
-                         CHECK(current_revision BETWEEN 0 AND 9007199254740991)
-                 ) STRICT;
-                 CREATE TABLE commits (
-                     vault_id BLOB NOT NULL REFERENCES vaults(vault_id) ON DELETE RESTRICT,
-                     operation_id BLOB NOT NULL CHECK(length(operation_id) = 16),
-                     expected_revision INTEGER NOT NULL
-                         CHECK(expected_revision BETWEEN 0 AND 9007199254740990),
-                     applied_revision INTEGER NOT NULL
-                         CHECK(applied_revision BETWEEN 1 AND 9007199254740991),
-                     payload_digest BLOB NOT NULL CHECK(length(payload_digest) = 32),
-                     encrypted_payload BLOB NOT NULL,
-                     PRIMARY KEY (vault_id, operation_id),
-                     UNIQUE (vault_id, applied_revision),
-                     CHECK(applied_revision = expected_revision + 1)
-                 ) STRICT;
-                 PRAGMA user_version = 1;",
-            )?;
+            transaction.execute_batch(include_str!("../migrations/001_initial.sql"))?;
+            transaction.execute_batch(include_str!("../migrations/002_access.sql"))?;
         }
-        1 => {}
+        1 => {
+            let existing_records: i64 = transaction.query_row(
+                "SELECT (SELECT count(*) FROM vaults) + (SELECT count(*) FROM commits)",
+                [],
+                |row| row.get(0),
+            )?;
+            if existing_records != 0 {
+                return Err(StoreError::LegacyVaultsNeedOwner);
+            }
+            transaction.execute_batch(include_str!("../migrations/002_access.sql"))?;
+        }
+        2 => {}
         other => return Err(StoreError::UnsupportedSchema(other)),
     }
     transaction.commit()?;
@@ -496,16 +767,204 @@ mod tests {
         let store = SqliteStore::open(&path).unwrap();
         store
             .connection
-            .execute_batch("PRAGMA user_version = 2")
+            .execute_batch("PRAGMA user_version = 3")
             .unwrap();
         drop(store);
 
         assert!(matches!(
             SqliteStore::open(&path),
-            Err(StoreError::UnsupportedSchema(2))
+            Err(StoreError::UnsupportedSchema(3))
         ));
         let connection = Connection::open(path).unwrap();
         let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+    }
+
+    #[test]
+    fn device_roles_and_revocation_guard_reads_and_writes() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sync.sqlite");
+        let mut store = SqliteStore::open(&path).unwrap();
+        let owner = store.create_user().unwrap();
+        let member = store.create_user().unwrap();
+        let (_, owner_token) = store.issue_device(owner).unwrap();
+        let (member_device, member_token) = store.issue_device(member).unwrap();
+        let vault_id = store.create_vault_for_owner(owner).unwrap();
+
+        assert_eq!(
+            store.current_revision_for(&owner_token, vault_id).unwrap(),
+            0
+        );
+        assert!(matches!(
+            store.current_revision_for(&member_token, vault_id),
+            Err(StoreError::Unauthorized)
+        ));
+        assert!(matches!(
+            store.commit_authenticated(&member_token, vault_id, operation(1), 0, b"packet"),
+            Err(StoreError::Unauthorized)
+        ));
+
+        store
+            .grant_member(&owner_token, vault_id, member, VaultRole::Reader)
+            .unwrap();
+        assert_eq!(
+            store.current_revision_for(&member_token, vault_id).unwrap(),
+            0
+        );
+        assert!(matches!(
+            store.commit_authenticated(&member_token, vault_id, operation(1), 0, b"packet"),
+            Err(StoreError::Unauthorized)
+        ));
+        assert!(matches!(
+            store.grant_member(&member_token, vault_id, member, VaultRole::Owner),
+            Err(StoreError::Unauthorized)
+        ));
+
+        store
+            .grant_member(&owner_token, vault_id, member, VaultRole::Writer)
+            .unwrap();
+        assert_eq!(
+            store
+                .commit_authenticated(&member_token, vault_id, operation(1), 0, b"packet")
+                .unwrap(),
+            CommitDecision::Apply { revision: 1 }
+        );
+        assert_eq!(
+            store
+                .encrypted_payload_for(&owner_token, vault_id, 1)
+                .unwrap(),
+            Some(b"packet".to_vec())
+        );
+
+        assert!(store.revoke_device(&member_token, member_device).unwrap());
+        assert!(matches!(
+            store.current_revision_for(&member_token, vault_id),
+            Err(StoreError::Unauthorized)
+        ));
+        assert!(matches!(
+            store.commit_authenticated(&member_token, vault_id, operation(2), 1, b"packet"),
+            Err(StoreError::Unauthorized)
+        ));
+        let (_, replacement_token) = store.issue_device(member).unwrap();
+        assert_eq!(
+            store
+                .current_revision_for(&replacement_token, vault_id)
+                .unwrap(),
+            1
+        );
+        assert!(store.revoke_member(&owner_token, vault_id, member).unwrap());
+        assert!(matches!(
+            store.encrypted_payload_for(&replacement_token, vault_id, 1),
+            Err(StoreError::Unauthorized)
+        ));
+        drop(store);
+        let mut reopened = SqliteStore::open(path).unwrap();
+        assert!(matches!(
+            reopened.current_revision_for(&member_token, vault_id),
+            Err(StoreError::Unauthorized)
+        ));
+        assert!(matches!(
+            reopened.current_revision_for(&replacement_token, vault_id),
+            Err(StoreError::Unauthorized)
+        ));
+        assert_eq!(
+            reopened
+                .current_revision_for(&owner_token, vault_id)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn last_owner_cannot_be_removed_or_demoted() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sync.sqlite");
+        let mut store = SqliteStore::open(path).unwrap();
+        let first_owner = store.create_user().unwrap();
+        let second_owner = store.create_user().unwrap();
+        let (_, first_token) = store.issue_device(first_owner).unwrap();
+        let (_, second_token) = store.issue_device(second_owner).unwrap();
+        let vault_id = store.create_vault_for_owner(first_owner).unwrap();
+
+        assert!(matches!(
+            store.revoke_member(&first_token, vault_id, first_owner),
+            Err(StoreError::LastOwner)
+        ));
+        assert!(matches!(
+            store.grant_member(&first_token, vault_id, first_owner, VaultRole::Reader),
+            Err(StoreError::LastOwner)
+        ));
+        store
+            .grant_member(&first_token, vault_id, second_owner, VaultRole::Owner)
+            .unwrap();
+        store
+            .grant_member(&first_token, vault_id, first_owner, VaultRole::Reader)
+            .unwrap();
+        assert!(matches!(
+            store.grant_member(&first_token, vault_id, first_owner, VaultRole::Owner),
+            Err(StoreError::Unauthorized)
+        ));
+        assert!(store
+            .revoke_member(&second_token, vault_id, first_owner)
+            .unwrap());
+        assert!(matches!(
+            store.revoke_member(&second_token, vault_id, second_owner),
+            Err(StoreError::LastOwner)
+        ));
+    }
+
+    #[test]
+    fn populated_schema_one_is_left_untouched_until_an_owner_can_be_assigned() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sync.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(include_str!("../migrations/001_initial.sql"))
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO vaults (vault_id, current_revision) VALUES (?1, 4)",
+                params![&vault(1).0[..]],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(matches!(
+            SqliteStore::open(&path),
+            Err(StoreError::LegacyVaultsNeedOwner)
+        ));
+        let connection = Connection::open(path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        let revision: i64 = connection
+            .query_row(
+                "SELECT current_revision FROM vaults WHERE vault_id = ?1",
+                params![&vault(1).0[..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision, 4);
+    }
+
+    #[test]
+    fn empty_schema_one_migrates_to_access_schema() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sync.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(include_str!("../migrations/001_initial.sql"))
+            .unwrap();
+        drop(connection);
+
+        let store = SqliteStore::open(path).unwrap();
+        let user_id = store.create_user().unwrap();
+        store.issue_device(user_id).unwrap();
+        let version: i64 = store
+            .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, 2);
