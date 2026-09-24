@@ -3,6 +3,7 @@ import { App, Notice, Plugin, PluginSettingTab, requestUrl, SecretComponent, Set
 import { applyInitialSnapshot } from './sync/apply';
 import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from './sync/plan';
 import { applyPacketToDigests, createPendingDownload, createPendingUpload, digestBytes, encodePacket, MAX_PACKET_BYTES, readPendingDownload, readPendingUpload, validateSyncPath } from './sync/packet';
+import { changesFromLocal, confirmedAfterInitialDownload, confirmedAfterUpload, readConfirmedState } from './sync/state';
 
 const MAX_PREVIEW_REVISIONS = 100;
 const MAX_PREVIEW_BYTES = 32 * 1024 * 1024;
@@ -41,14 +42,15 @@ export default class OwnSyncPlugin extends Plugin {
   settings: OwnSyncSettings = DEFAULT_SETTINGS;
   private pendingUpload: unknown = null;
   private pendingDownload: unknown = null;
-  private uploadRunning = false;
-  private downloadRunning = false;
+  private confirmed: unknown = null;
+  private mutationRunning = false;
   private saveChain: Promise<void> = Promise.resolve();
 
   async onload(): Promise<void> {
     const saved = await this.loadData() as (Partial<OwnSyncSettings> & {
       pendingUpload?: unknown;
       pendingDownload?: unknown;
+      confirmed?: unknown;
     }) | null;
     this.settings = {
       serverUrl: typeof saved?.serverUrl === 'string' ? saved.serverUrl : '',
@@ -57,6 +59,7 @@ export default class OwnSyncPlugin extends Plugin {
     };
     this.pendingUpload = saved?.pendingUpload ?? null;
     this.pendingDownload = saved?.pendingDownload ?? null;
+    this.confirmed = saved?.confirmed ?? null;
 
     this.addSettingTab(new OwnSyncSettingTab(this.app, this));
     this.addCommand({
@@ -84,10 +87,20 @@ export default class OwnSyncPlugin extends Plugin {
       name: 'Download first test revision into empty vault',
       callback: () => { void this.downloadTestVault(); },
     });
+    this.addCommand({
+      id: 'push-local-changes',
+      name: 'Push local test changes',
+      callback: () => { void this.pushLocalChanges(); },
+    });
   }
 
   async saveSettings(): Promise<void> {
-    const snapshot = { ...this.settings, pendingUpload: this.pendingUpload, pendingDownload: this.pendingDownload };
+    const snapshot = {
+      ...this.settings,
+      pendingUpload: this.pendingUpload,
+      pendingDownload: this.pendingDownload,
+      confirmed: this.confirmed,
+    };
     this.saveChain = this.saveChain.catch(() => {}).then(() => this.saveData(snapshot));
     await this.saveChain;
   }
@@ -228,12 +241,12 @@ export default class OwnSyncPlugin extends Plugin {
   }
 
   async uploadTestVault(): Promise<void> {
-    if (this.uploadRunning) return;
-    this.uploadRunning = true;
+    if (this.mutationRunning) return;
+    this.mutationRunning = true;
     try {
       await this.uploadTestVaultOnce();
     } finally {
-      this.uploadRunning = false;
+      this.mutationRunning = false;
     }
   }
 
@@ -249,6 +262,10 @@ export default class OwnSyncPlugin extends Plugin {
     const endpoint = `${connection.baseUrl}/api/v0/vaults/${vaultId}`;
     if (this.pendingDownload !== null) {
       new Notice('Own Sync: finish the pending test download before uploading.');
+      return;
+    }
+    if (this.confirmed !== null && this.pendingUpload === null) {
+      new Notice('Own Sync: initial upload is already confirmed. Use Push local test changes.');
       return;
     }
     if (this.pendingUpload === null) {
@@ -292,49 +309,16 @@ export default class OwnSyncPlugin extends Plugin {
       }
     }
 
-    try {
-      const { pending, body } = await readPendingUpload(this.pendingUpload);
-      if (pending.serverUrl !== connection.baseUrl || pending.vaultId !== vaultId) {
-        new Notice('Own Sync: pending upload belongs to another server or vault. Restore its settings before retrying.');
-        return;
-      }
-      const response = await requestUrl({
-        url: `${endpoint}/operations/${pending.operationId}`,
-        method: 'POST',
-        contentType: 'application/octet-stream',
-        headers: {
-          Authorization: `Bearer ${connection.token}`,
-          'X-Expected-Revision': '0',
-        },
-        body,
-        throw: false,
-      });
-      if ((response.status === 201 && response.json?.result === 'applied' ||
-        response.status === 200 && response.json?.result === 'replayed') &&
-        response.json?.revision === 1) {
-        this.pendingUpload = null;
-        try {
-          await this.saveSettings();
-          new Notice('Own Sync: test vault uploaded as revision 1. Files on this device were not changed.');
-        } catch {
-          this.pendingUpload = pending;
-          new Notice('Own Sync: server accepted the upload, but local confirmation could not be saved. Retry is safe.');
-        }
-      } else {
-        new Notice(`Own Sync: server did not accept test upload (HTTP ${response.status}). Pending operation kept.`);
-      }
-    } catch {
-      new Notice('Own Sync: upload result unknown. Pending operation kept for an identical retry.');
-    }
+    await this.submitPendingUpload(connection);
   }
 
   async downloadTestVault(): Promise<void> {
-    if (this.downloadRunning) return;
-    this.downloadRunning = true;
+    if (this.mutationRunning) return;
+    this.mutationRunning = true;
     try {
       await this.downloadTestVaultOnce();
     } finally {
-      this.downloadRunning = false;
+      this.mutationRunning = false;
     }
   }
 
@@ -348,6 +332,10 @@ export default class OwnSyncPlugin extends Plugin {
     }
     if (this.pendingUpload !== null) {
       new Notice('Own Sync: finish the pending test upload before downloading.');
+      return;
+    }
+    if (this.confirmed !== null && this.pendingDownload === null) {
+      new Notice('Own Sync: this vault already has confirmed state. First download is complete.');
       return;
     }
     const vaultId = connection.vaultId.toLowerCase();
@@ -415,16 +403,164 @@ export default class OwnSyncPlugin extends Plugin {
           await vault.createBinary(path, new Uint8Array(bytes).buffer);
         },
       }, changes);
+      const nextConfirmed = await confirmedAfterInitialDownload(pending);
+      const previousConfirmed = this.confirmed;
       this.pendingDownload = null;
+      this.confirmed = nextConfirmed;
       try {
         await this.saveSettings();
         new Notice(`Own Sync: downloaded ${changes.length} test files. Later revisions are not synced.`);
       } catch {
         this.pendingDownload = pending;
+        this.confirmed = previousConfirmed;
         new Notice('Own Sync: files were created, but local confirmation failed. An identical retry is safe.');
       }
     } catch {
       new Notice('Own Sync: download stopped. Pending packet kept; existing files were not overwritten.');
+    }
+  }
+
+  async pushLocalChanges(): Promise<void> {
+    if (this.mutationRunning) return;
+    this.mutationRunning = true;
+    try {
+      await this.pushLocalChangesOnce();
+    } finally {
+      this.mutationRunning = false;
+    }
+  }
+
+  private async pushLocalChangesOnce(): Promise<void> {
+    let connection: { baseUrl: string; vaultId: string; token: string };
+    try {
+      connection = this.vaultConnection();
+    } catch (error) {
+      new Notice(`Own Sync: ${(error as Error).message}`);
+      return;
+    }
+    if (this.pendingDownload !== null) {
+      new Notice('Own Sync: finish the pending test download before pushing changes.');
+      return;
+    }
+    if (this.pendingUpload !== null) {
+      await this.submitPendingUpload(connection);
+      return;
+    }
+
+    let confirmed: ReturnType<typeof readConfirmedState>;
+    try {
+      confirmed = readConfirmedState(this.confirmed);
+      if (confirmed.state.serverUrl !== connection.baseUrl ||
+        confirmed.state.vaultId !== connection.vaultId.toLowerCase()) {
+        throw new Error('Confirmed state belongs to another server or vault.');
+      }
+    } catch {
+      new Notice('Own Sync: no valid confirmed base for this vault. Complete the first test transfer.');
+      return;
+    }
+
+    const endpoint = `${connection.baseUrl}/api/v0/vaults/${confirmed.state.vaultId}`;
+    try {
+      const head = await requestUrl({
+        url: `${endpoint}/head`, method: 'GET',
+        headers: { Authorization: `Bearer ${connection.token}` }, throw: false,
+      });
+      if (head.status !== 200 || head.json?.current_revision !== confirmed.state.revision) {
+        new Notice('Own Sync: server revision differs from the confirmed base. Local files were not sent.');
+        return;
+      }
+      const local = new Map<string, { digest: string; bytes: Uint8Array }>();
+      let scannedBytes = 0;
+      for (const file of this.app.vault.getFiles()) {
+        validateSyncPath(file.path);
+        scannedBytes += file.stat.size;
+        if (scannedBytes > MAX_PREVIEW_BYTES) {
+          new Notice('Own Sync: local test vault exceeds the 32 MiB scan limit. No files sent.');
+          return;
+        }
+        const bytes = new Uint8Array(await this.app.vault.readBinary(file));
+        scannedBytes += bytes.byteLength - file.stat.size;
+        if (scannedBytes > MAX_PREVIEW_BYTES) {
+          new Notice('Own Sync: local test vault exceeds the 32 MiB scan limit. No files sent.');
+          return;
+        }
+        local.set(file.path, { digest: await digestBytes(bytes), bytes });
+      }
+      assertNoCaseCollisions(new Set([...confirmed.digests.keys(), ...local.keys()]));
+      assertNoFileDirectoryCollisions(local.keys());
+      const changes = changesFromLocal(confirmed.digests, local);
+      if (changes.length === 0) {
+        new Notice(`Own Sync: local files match confirmed revision ${confirmed.state.revision}.`);
+        return;
+      }
+      const packet = await encodePacket(changes);
+      this.pendingUpload = createPendingUpload(
+        connection.baseUrl, confirmed.state.vaultId, packet, confirmed.state.revision,
+      );
+      try {
+        await this.saveSettings();
+      } catch {
+        this.pendingUpload = null;
+        throw new Error('Could not persist pending changes.');
+      }
+    } catch {
+      new Notice('Own Sync: could not prepare or save local changes. No new request sent.');
+      return;
+    }
+    await this.submitPendingUpload(connection);
+  }
+
+  private async submitPendingUpload(connection: { baseUrl: string; vaultId: string; token: string }): Promise<void> {
+    let pending: Awaited<ReturnType<typeof readPendingUpload>>['pending'];
+    let body: ArrayBuffer;
+    let nextConfirmed: Awaited<ReturnType<typeof confirmedAfterUpload>>;
+    try {
+      ({ pending, body } = await readPendingUpload(this.pendingUpload));
+      if (pending.serverUrl !== connection.baseUrl || pending.vaultId !== connection.vaultId.toLowerCase()) {
+        new Notice('Own Sync: pending upload belongs to another server or vault. Restore its settings before retrying.');
+        return;
+      }
+      nextConfirmed = await confirmedAfterUpload(this.confirmed, pending);
+    } catch {
+      new Notice('Own Sync: pending upload or confirmed base is invalid. No request sent.');
+      return;
+    }
+
+    const expectedRevision = pending.expectedRevision ?? 0;
+    const endpoint = `${connection.baseUrl}/api/v0/vaults/${pending.vaultId}`;
+    try {
+      const response = await requestUrl({
+        url: `${endpoint}/operations/${pending.operationId}`,
+        method: 'POST',
+        contentType: 'application/octet-stream',
+        headers: {
+          Authorization: `Bearer ${connection.token}`,
+          'X-Expected-Revision': String(expectedRevision),
+        },
+        body,
+        throw: false,
+      });
+      const accepted = (response.status === 201 && response.json?.result === 'applied') ||
+        (response.status === 200 && response.json?.result === 'replayed');
+      if (accepted && response.json?.revision === expectedRevision + 1) {
+        const previousConfirmed = this.confirmed;
+        this.confirmed = nextConfirmed;
+        this.pendingUpload = null;
+        try {
+          await this.saveSettings();
+          new Notice(`Own Sync: test changes confirmed at revision ${nextConfirmed.revision}.`);
+        } catch {
+          this.confirmed = previousConfirmed;
+          this.pendingUpload = pending;
+          new Notice('Own Sync: server accepted changes, but local confirmation failed. Retry is safe.');
+        }
+      } else if (response.status === 409) {
+        new Notice('Own Sync: server changed during upload. Pending operation kept; reconciliation is required.');
+      } else {
+        new Notice(`Own Sync: server did not accept changes (HTTP ${response.status}). Pending operation kept.`);
+      }
+    } catch {
+      new Notice('Own Sync: upload result unknown. Pending operation kept for an identical retry.');
     }
   }
 }
@@ -440,7 +576,7 @@ class OwnSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Server URL')
-      .setDesc('Address of your own server. This development build only checks connectivity and vault access; it does not sync files.')
+      .setDesc('Address of your own server. This development build supports only manual, unencrypted test transfers.')
       .addText((text) => text
         .setPlaceholder('https://sync.example.com')
         .setValue(this.plugin.settings.serverUrl)
@@ -513,6 +649,15 @@ class OwnSyncSettingTab extends PluginSettingTab {
         .setButtonText('Download test vault')
         .onClick(async () => {
           await this.plugin.downloadTestVault();
+        }));
+
+    new Setting(containerEl)
+      .setName('Push local test changes')
+      .setDesc('After the first transfer, send local additions, edits and deletions only when the server revision still matches. This is a manual unencrypted test operation.')
+      .addButton((button) => button
+        .setButtonText('Push local changes')
+        .onClick(async () => {
+          await this.plugin.pushLocalChanges();
         }));
   }
 }

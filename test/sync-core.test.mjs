@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { applyInitialSnapshot } from '../src/sync/apply.ts';
 import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from '../src/sync/plan.ts';
 import { applyPacketToDigests, createPendingDownload, createPendingUpload, decodePacket, digestBytes, encodePacket, readPendingDownload, readPendingUpload, validateSyncPath } from '../src/sync/packet.ts';
+import { changesFromLocal, confirmedAfterInitialDownload, confirmedAfterUpload, readConfirmedState } from '../src/sync/state.ts';
 
 const map = (entries) => new Map(entries);
 
@@ -174,4 +175,59 @@ test('initial download refuses unrelated or modified files without overwriting t
   files.set('unrelated.md', new Uint8Array([2]));
   await assert.rejects(applyInitialSnapshot(store, changes));
   assert.equal(created, false);
+});
+
+test('persists a confirmed baseline after upload and advances it with edits and deletion', async () => {
+  const first = await encodePacket([
+    { path: 'a.md', kind: 'put', bytes: new Uint8Array([1]) },
+    { path: 'b.md', kind: 'put', bytes: new Uint8Array([2]) },
+  ]);
+  const initial = createPendingUpload('https://sync.example.com', 'a'.repeat(32), first);
+  const confirmed = await confirmedAfterUpload(null, initial);
+  assert.equal(confirmed.revision, 1);
+  assert.equal(readConfirmedState(JSON.parse(JSON.stringify(confirmed))).digests.size, 2);
+
+  const next = await encodePacket([
+    { path: 'a.md', kind: 'put', bytes: new Uint8Array([3]) },
+    { path: 'b.md', kind: 'delete' },
+  ]);
+  const pending = createPendingUpload(confirmed.serverUrl, confirmed.vaultId, next, 1);
+  const advanced = await confirmedAfterUpload(confirmed, pending);
+  assert.equal(advanced.revision, 2);
+  assert.deepEqual(Object.keys(advanced.digests), ['a.md']);
+  assert.equal(advanced.digests['a.md'], await digestBytes(new Uint8Array([3])));
+  await assert.rejects(confirmedAfterUpload(null, pending));
+});
+
+test('builds local put and delete changes from a confirmed baseline', async () => {
+  const a = await digestBytes(new Uint8Array([1]));
+  const b = await digestBytes(new Uint8Array([2]));
+  const c = await digestBytes(new Uint8Array([3]));
+  const changes = changesFromLocal(map([['a.md', a], ['b.md', b]]), map([
+    ['a.md', { digest: a, bytes: new Uint8Array([1]) }],
+    ['c.bin', { digest: c, bytes: new Uint8Array([3]) }],
+  ]));
+  assert.deepEqual(changes, [
+    { path: 'b.md', kind: 'delete' },
+    { path: 'c.bin', kind: 'put', bytes: new Uint8Array([3]) },
+  ]);
+});
+
+test('initial download creates the same confirmed baseline', async () => {
+  const packet = await encodePacket([{ path: 'x.md', kind: 'put', bytes: new Uint8Array([7]) }]);
+  const pending = createPendingDownload('https://sync.example.com', 'b'.repeat(32), packet.buffer);
+  const confirmed = await confirmedAfterInitialDownload(pending);
+  assert.equal(confirmed.revision, 1);
+  assert.equal(confirmed.digests['x.md'], await digestBytes(new Uint8Array([7])));
+});
+
+test('rejects corrupted confirmed digests and preserves old pending upload format', async () => {
+  const packet = await encodePacket([{ path: 'x.md', kind: 'put', bytes: new Uint8Array([1]) }]);
+  const pending = createPendingUpload('https://sync.example.com', 'c'.repeat(32), packet);
+  delete pending.expectedRevision;
+  const restored = await readPendingUpload(JSON.parse(JSON.stringify(pending)));
+  assert.equal(restored.pending.expectedRevision ?? 0, 0);
+  const confirmed = await confirmedAfterUpload(null, pending);
+  confirmed.digests['x.md'] = 'bad';
+  assert.throws(() => readConfirmedState(confirmed));
 });

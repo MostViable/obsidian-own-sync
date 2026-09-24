@@ -5,6 +5,7 @@ export interface PendingUpload {
   serverUrl: string;
   vaultId: string;
   operationId: string;
+  expectedRevision?: number;
   packetText: string;
 }
 
@@ -165,7 +166,12 @@ export async function applyPacketToDigests(state: Map<string, string>, packet: A
   }
 }
 
-export function createPendingUpload(serverUrl: string, vaultId: string, packet: Uint8Array): PendingUpload {
+export function createPendingUpload(
+  serverUrl: string, vaultId: string, packet: Uint8Array, expectedRevision = 0,
+): PendingUpload {
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || expectedRevision === Number.MAX_SAFE_INTEGER) {
+    throw new Error('Invalid expected revision.');
+  }
   const id = new Uint8Array(16);
   crypto.getRandomValues(id);
   return {
@@ -173,6 +179,7 @@ export function createPendingUpload(serverUrl: string, vaultId: string, packet: 
     serverUrl,
     vaultId,
     operationId: [...id].map((part) => part.toString(16).padStart(2, '0')).join(''),
+    expectedRevision,
     packetText: textDecoder.decode(packet),
   };
 }
@@ -182,10 +189,14 @@ export async function readPendingUpload(value: unknown): Promise<{ pending: Pend
     throw new Error('Invalid pending upload.');
   }
   const candidate = value as Record<string, unknown>;
+  const expectedRevision = candidate.expectedRevision === undefined ? 0 : candidate.expectedRevision;
   if (candidate.formatVersion !== 1 || typeof candidate.serverUrl !== 'string' ||
     typeof candidate.vaultId !== 'string' || !/^[0-9a-f]{32}$/i.test(candidate.vaultId) ||
     typeof candidate.operationId !== 'string' || !/^[0-9a-f]{32}$/i.test(candidate.operationId) ||
-    typeof candidate.packetText !== 'string' || Object.keys(candidate).length !== 5) {
+    typeof candidate.packetText !== 'string' ||
+    typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) ||
+    expectedRevision < 0 || expectedRevision === Number.MAX_SAFE_INTEGER ||
+    Object.keys(candidate).length !== (candidate.expectedRevision === undefined ? 5 : 6)) {
     throw new Error('Invalid pending upload.');
   }
   const body = textEncoder.encode(candidate.packetText).buffer;
