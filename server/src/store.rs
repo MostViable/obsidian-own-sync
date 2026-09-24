@@ -84,8 +84,10 @@ impl SqliteStore {
         let mut connection = Connection::open_with_flags(path, flags)?;
         connection.busy_timeout(Duration::from_secs(5))?;
 
-        let mode: String =
-            connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        let mut mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if mode != "wal" {
+            mode = connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        }
         if mode != "wal" {
             return Err(StoreError::UnsupportedJournalMode(mode));
         }
@@ -237,6 +239,16 @@ impl SqliteStore {
             read_current_revision(&transaction, vault_id)?.ok_or(StoreError::InconsistentState)?;
         transaction.commit()?;
         Ok(revision)
+    }
+
+    /// An early permission check for callers that must reject before reading a request body.
+    /// `commit_authenticated` checks again inside its write transaction.
+    pub fn ensure_write_access(
+        &self,
+        token: &DeviceToken,
+        vault_id: VaultId,
+    ) -> Result<(), StoreError> {
+        authorize(&self.connection, token, vault_id, RequiredRole::Writer)
     }
 
     #[cfg(test)]
@@ -500,6 +512,10 @@ fn digest(payload: &[u8]) -> PayloadDigest {
 }
 
 fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
+    let current_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current_version == 2 {
+        return Ok(());
+    }
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     match version {
@@ -536,7 +552,11 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, sync::Barrier, thread};
+    use std::{
+        sync::{mpsc, Arc, Barrier},
+        thread,
+        time::Duration,
+    };
 
     use tempfile::tempdir;
 
@@ -642,6 +662,26 @@ mod tests {
             store.encrypted_payload(vault(1), 1).unwrap(),
             Some(payload) if payload == [1] || payload == [2]
         ));
+    }
+
+    #[test]
+    fn opening_an_existing_store_does_not_wait_for_a_writer() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sync.sqlite");
+        SqliteStore::open(&path).unwrap();
+
+        let mut blocker = Connection::open(&path).unwrap();
+        let transaction = blocker
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender.send(SqliteStore::open(path).map(|_| ())).unwrap();
+        });
+        let opened_while_writer_active = receiver.recv_timeout(Duration::from_millis(500));
+        transaction.rollback().unwrap();
+        handle.join().unwrap();
+        assert!(matches!(opened_while_writer_active, Ok(Ok(()))));
     }
 
     #[test]
