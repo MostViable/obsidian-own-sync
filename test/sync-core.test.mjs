@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { assertNoCaseCollisions, planSync } from '../src/sync/plan.ts';
-import { applyPacketToDigests, createPendingUpload, decodePacket, digestBytes, encodePacket, readPendingUpload, validateSyncPath } from '../src/sync/packet.ts';
+import { applyInitialSnapshot } from '../src/sync/apply.ts';
+import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from '../src/sync/plan.ts';
+import { applyPacketToDigests, createPendingDownload, createPendingUpload, decodePacket, digestBytes, encodePacket, readPendingDownload, readPendingUpload, validateSyncPath } from '../src/sync/packet.ts';
 
 const map = (entries) => new Map(entries);
 
@@ -44,7 +45,14 @@ test('first sync does not overwrite differently populated paths', () => {
 
 test('detects case collisions before applying remote paths', () => {
   assert.throws(() => assertNoCaseCollisions(['Notes/A.md', 'notes/a.md']));
+  assert.throws(() => assertNoCaseCollisions(['Notes/A.md', 'notes/B.md']));
   assert.doesNotThrow(() => assertNoCaseCollisions(['A.md', 'B.md']));
+  assert.doesNotThrow(() => assertNoCaseCollisions(['Notes/A.md', 'Notes/B.md']));
+});
+
+test('rejects remote file paths that are also parent directories', () => {
+  assert.throws(() => assertNoFileDirectoryCollisions(['note.md', 'note.md/child.md']));
+  assert.doesNotThrow(() => assertNoFileDirectoryCollisions(['folder/a.md', 'folder/b.md']));
 });
 
 test('binary packet round trips Cyrillic paths and deletion', async () => {
@@ -73,7 +81,7 @@ test('replays remote create, update and delete in revision order', async () => {
 
 test('rejects traversal and paths unsafe across platforms', () => {
   for (const path of ['../a.md', 'a/../b.md', '/a.md', 'a\\b.md', '.obsidian/data.json',
-    'a/.hidden', 'CON.txt', 'a/file.', 'a//b']) {
+    'a/.hidden', 'CON.txt', 'a/file.', 'a//b', 'extensionless']) {
     assert.throws(() => validateSyncPath(path), undefined, path);
   }
 });
@@ -108,4 +116,62 @@ test('persists exact packet bytes and operation ID for retry', async () => {
   assert.equal(restored.pending.operationId, pending.operationId);
   assert.deepEqual(new Uint8Array(restored.body), packet);
   await assert.rejects(readPendingUpload({ ...pending, packetText: pending.packetText.replace('test.md', '../test.md') }));
+});
+
+test('persists an initial download and rejects deletions', async () => {
+  const packet = await encodePacket([{ path: 'test.md', kind: 'put', bytes: new Uint8Array([1]) }]);
+  const pending = createPendingDownload('https://sync.example.com', 'b'.repeat(32), packet.buffer);
+  const restored = await readPendingDownload(JSON.parse(JSON.stringify(pending)));
+  assert.deepEqual(restored.changes, [{ path: 'test.md', kind: 'put', bytes: new Uint8Array([1]) }]);
+  const deletion = await encodePacket([{ path: 'test.md', kind: 'delete' }]);
+  await assert.rejects(readPendingDownload(createPendingDownload('https://sync.example.com', 'b'.repeat(32), deletion.buffer)));
+});
+
+test('initial download creates nested binary files and resumes after an interrupted write', async () => {
+  const files = new Map();
+  const folders = new Set();
+  let interruptAfterFirstCreate = true;
+  const store = {
+    listPaths: () => [...files.keys()],
+    read: async (path) => files.get(path) ?? null,
+    ensureFolder: async (path) => {
+      if (files.has(path)) throw new Error('parent is a file');
+      folders.add(path);
+    },
+    create: async (path, bytes) => {
+      if (files.has(path)) throw new Error('would overwrite');
+      files.set(path, new Uint8Array(bytes));
+      if (interruptAfterFirstCreate) {
+        interruptAfterFirstCreate = false;
+        throw new Error('simulated interruption');
+      }
+    },
+  };
+  const changes = [
+    { path: 'Notes/a.md', kind: 'put', bytes: new Uint8Array([1]) },
+    { path: 'Notes/b.bin', kind: 'put', bytes: new Uint8Array([0, 255]) },
+  ];
+  await assert.rejects(applyInitialSnapshot(store, changes));
+  assert.deepEqual([...files.keys()], ['Notes/a.md']);
+  await applyInitialSnapshot(store, changes);
+  assert.deepEqual([...files.keys()], ['Notes/a.md', 'Notes/b.bin']);
+  assert.ok(folders.has('Notes'));
+});
+
+test('initial download refuses unrelated or modified files without overwriting them', async () => {
+  const files = new Map([['note.md', new Uint8Array([9])]]);
+  let created = false;
+  const store = {
+    listPaths: () => [...files.keys()],
+    read: async (path) => files.get(path) ?? null,
+    ensureFolder: async () => {},
+    create: async () => { created = true; },
+  };
+  const changes = [{ path: 'note.md', kind: 'put', bytes: new Uint8Array([1]) }];
+  await assert.rejects(applyInitialSnapshot(store, changes));
+  assert.equal(created, false);
+  assert.deepEqual(files.get('note.md'), new Uint8Array([9]));
+  files.set('unrelated.md', new Uint8Array([2]));
+  await assert.rejects(applyInitialSnapshot(store, changes));
+  assert.equal(created, false);
 });

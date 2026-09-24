@@ -8,6 +8,14 @@ export interface PendingUpload {
   packetText: string;
 }
 
+export interface PendingDownload {
+  formatVersion: 1;
+  serverUrl: string;
+  vaultId: string;
+  revision: 1;
+  packetText: string;
+}
+
 export type FileChange =
   | { path: string; kind: 'put'; bytes: Uint8Array }
   | { path: string; kind: 'delete' };
@@ -35,6 +43,10 @@ export function validateSyncPath(path: string): void {
       /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(segment)) {
       throw new Error('Invalid sync path.');
     }
+  }
+  const segments = path.split('/');
+  if (!segments[segments.length - 1].includes('.')) {
+    throw new Error('Sync file path needs an extension.');
   }
 }
 
@@ -179,4 +191,32 @@ export async function readPendingUpload(value: unknown): Promise<{ pending: Pend
   const body = textEncoder.encode(candidate.packetText).buffer;
   await decodePacket(body);
   return { pending: candidate as unknown as PendingUpload, body };
+}
+
+export function createPendingDownload(serverUrl: string, vaultId: string, packet: ArrayBuffer): PendingDownload {
+  return {
+    formatVersion: 1,
+    serverUrl,
+    vaultId,
+    revision: 1,
+    packetText: textDecoder.decode(packet),
+  };
+}
+
+export async function readPendingDownload(value: unknown): Promise<{ pending: PendingDownload; changes: FileChange[] }> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Invalid pending download.');
+  }
+  const candidate = value as Record<string, unknown>;
+  if (candidate.formatVersion !== 1 || typeof candidate.serverUrl !== 'string' ||
+    typeof candidate.vaultId !== 'string' || !/^[0-9a-f]{32}$/i.test(candidate.vaultId) ||
+    candidate.revision !== 1 || typeof candidate.packetText !== 'string' ||
+    Object.keys(candidate).length !== 5) {
+    throw new Error('Invalid pending download.');
+  }
+  const changes = await decodePacket(textEncoder.encode(candidate.packetText).buffer);
+  if (changes.some((change) => change.kind !== 'put')) {
+    throw new Error('Initial download cannot contain deletions.');
+  }
+  return { pending: candidate as unknown as PendingDownload, changes };
 }
