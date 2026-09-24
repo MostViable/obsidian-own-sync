@@ -7,10 +7,13 @@ publish = false
 [dependencies]
 axum = "0.8.9"
 getrandom = "0.4.3"
+hex = "0.4.3"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.11.0"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
 
 [dev-dependencies]
+serde_json = "1"
 tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }
