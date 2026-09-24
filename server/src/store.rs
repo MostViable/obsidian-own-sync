@@ -336,6 +336,15 @@ impl SqliteStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn active_device_count_for_test(&self) -> Result<i64, StoreError> {
+        Ok(self.connection.query_row(
+            "SELECT count(*) FROM devices WHERE revoked = 0",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    #[cfg(test)]
     fn create_vault(&self, vault_id: VaultId) -> Result<(), StoreError> {
         self.connection.execute(
             "INSERT INTO vaults (vault_id, current_revision) VALUES (?1, 0)",
