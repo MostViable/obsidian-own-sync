@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { applyInitialSnapshot } from '../src/sync/apply.ts';
+import { applyInitialSnapshot, applyRemoteChanges } from '../src/sync/apply.ts';
 import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from '../src/sync/plan.ts';
 import { applyPacketToDigests, createPendingDownload, createPendingUpload, decodePacket, digestBytes, encodePacket, readPendingDownload, readPendingUpload, validateSyncPath } from '../src/sync/packet.ts';
-import { changesFromLocal, confirmedAfterInitialDownload, confirmedAfterUpload, planFromConfirmed, readConfirmedState } from '../src/sync/state.ts';
+import { advanceConfirmedRevision, changesFromLocal, confirmedAfterInitialDownload, confirmedAfterPull, confirmedAfterUpload, createPendingPull, planFromConfirmed, readConfirmedState, readPendingPull } from '../src/sync/state.ts';
 
 const map = (entries) => new Map(entries);
 
@@ -262,4 +262,110 @@ test('confirmed preview rejects paths that cannot safely coexist', () => {
     map([['notes/b.md', 'remote']])));
   assert.throws(() => planFromConfirmed(map([]), map([['parent.md', 'local']]),
     map([['parent.md/child.md', 'remote']])));
+});
+
+test('pending remote pull advances the confirmed base only after validated changes', async () => {
+  const first = await encodePacket([
+    { path: 'a.md', kind: 'put', bytes: new Uint8Array([1]) },
+    { path: 'b.md', kind: 'put', bytes: new Uint8Array([2]) },
+  ]);
+  const confirmed = await confirmedAfterUpload(null, createPendingUpload('https://sync.example.com', 'd'.repeat(32), first));
+  const packet = await encodePacket([
+    { path: 'a.md', kind: 'put', bytes: new Uint8Array([3]) },
+    { path: 'b.md', kind: 'delete' },
+  ]);
+  const pending = createPendingPull(confirmed.serverUrl, confirmed.vaultId, 1, 3, packet);
+  assert.deepEqual((await readPendingPull(JSON.parse(JSON.stringify(pending)))).changes,
+    await decodePacket(packet.buffer));
+  const next = await confirmedAfterPull(confirmed, pending);
+  assert.equal(next.revision, 3);
+  assert.deepEqual(Object.keys(next.digests), ['a.md']);
+  assert.equal(confirmed.revision, 1);
+  await assert.rejects(confirmedAfterPull(confirmed, { ...pending, fromRevision: 2 }));
+  assert.equal(advanceConfirmedRevision(confirmed, 2).revision, 2);
+});
+
+test('remote pull resumes after an interrupted deletion and preserves unrelated files', async () => {
+  const files = map([
+    ['old.md', new Uint8Array([1])],
+    ['edit.md', new Uint8Array([1])],
+    ['untouched.md', new Uint8Array([9])],
+  ]);
+  const removed = [];
+  let interrupt = true;
+  const store = {
+    listPaths: () => [...files.keys()],
+    read: async (path) => files.get(path) ?? null,
+    ensureFolder: async () => {},
+    put: async (path, bytes) => { files.set(path, new Uint8Array(bytes)); },
+    remove: async (path) => {
+      removed.push(path);
+      files.delete(path);
+      if (interrupt) {
+        interrupt = false;
+        throw new Error('simulated interruption');
+      }
+    },
+  };
+  const old = await digestBytes(new Uint8Array([1]));
+  const base = map([['old.md', old], ['edit.md', old],
+    ['untouched.md', await digestBytes(new Uint8Array([9]))]]);
+  const changes = [
+    { path: 'old.md', kind: 'delete' },
+    { path: 'edit.md', kind: 'put', bytes: new Uint8Array([2]) },
+    { path: 'new.md', kind: 'put', bytes: new Uint8Array([3]) },
+  ];
+  await assert.rejects(applyRemoteChanges(store, base, changes));
+  assert.equal(files.has('old.md'), false);
+  await applyRemoteChanges(store, base, changes);
+  assert.deepEqual(removed, ['old.md']);
+  assert.deepEqual(files.get('edit.md'), new Uint8Array([2]));
+  assert.deepEqual(files.get('new.md'), new Uint8Array([3]));
+  assert.deepEqual(files.get('untouched.md'), new Uint8Array([9]));
+  await applyRemoteChanges(store, base, changes);
+  assert.deepEqual(removed, ['old.md']);
+});
+
+test('remote pull rejects a local edit before any file is changed', async () => {
+  const files = map([['a.md', new Uint8Array([7])], ['b.md', new Uint8Array([1])]]);
+  let writes = 0;
+  const store = {
+    listPaths: () => [...files.keys()],
+    read: async (path) => files.get(path) ?? null,
+    ensureFolder: async () => {},
+    put: async () => { writes += 1; },
+    remove: async () => { writes += 1; },
+  };
+  const base = map([['a.md', await digestBytes(new Uint8Array([1]))],
+    ['b.md', await digestBytes(new Uint8Array([1]))]]);
+  await assert.rejects(applyRemoteChanges(store, base, [
+    { path: 'b.md', kind: 'delete' },
+    { path: 'a.md', kind: 'put', bytes: new Uint8Array([2]) },
+  ]));
+  assert.equal(writes, 0);
+  assert.deepEqual(files.get('b.md'), new Uint8Array([1]));
+});
+
+test('remote pull can replace a file with a folder and resume', async () => {
+  const files = map([['parent.md', new Uint8Array([1])]]);
+  const folders = new Set();
+  const store = {
+    listPaths: () => [...files.keys()],
+    read: async (path) => files.get(path) ?? null,
+    ensureFolder: async (path) => {
+      if (files.has(path)) throw new Error('parent is a file');
+      folders.add(path);
+    },
+    put: async (path, bytes) => { files.set(path, new Uint8Array(bytes)); },
+    remove: async (path) => { files.delete(path); },
+  };
+  const base = map([['parent.md', await digestBytes(new Uint8Array([1]))]]);
+  const changes = [
+    { path: 'parent.md', kind: 'delete' },
+    { path: 'parent.md/child.md', kind: 'put', bytes: new Uint8Array([2]) },
+  ];
+  await applyRemoteChanges(store, base, changes);
+  await applyRemoteChanges(store, base, changes);
+  assert.ok(folders.has('parent.md'));
+  assert.deepEqual(files.get('parent.md/child.md'), new Uint8Array([2]));
 });

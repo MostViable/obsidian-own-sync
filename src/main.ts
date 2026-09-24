@@ -1,9 +1,9 @@
 import { App, Notice, Plugin, PluginSettingTab, requestUrl, SecretComponent, Setting, TFile, TFolder } from 'obsidian';
 
-import { applyInitialSnapshot } from './sync/apply';
+import { applyInitialSnapshot, applyRemoteChanges } from './sync/apply';
 import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from './sync/plan';
-import { applyPacketToDigests, createPendingDownload, createPendingUpload, digestBytes, encodePacket, MAX_PACKET_BYTES, readPendingDownload, readPendingUpload, validateSyncPath } from './sync/packet';
-import { changesFromLocal, confirmedAfterInitialDownload, confirmedAfterUpload, planFromConfirmed, readConfirmedState } from './sync/state';
+import { applyPacketToDigests, createPendingDownload, createPendingUpload, decodePacket, digestBytes, encodePacket, MAX_PACKET_BYTES, readPendingDownload, readPendingUpload, validateSyncPath, type FileChange } from './sync/packet';
+import { advanceConfirmedRevision, changesFromLocal, confirmedAfterInitialDownload, confirmedAfterPull, confirmedAfterUpload, createPendingPull, planFromConfirmed, readConfirmedState, readPendingPull } from './sync/state';
 
 const MAX_PREVIEW_REVISIONS = 100;
 const MAX_PREVIEW_BYTES = 32 * 1024 * 1024;
@@ -42,6 +42,7 @@ export default class OwnSyncPlugin extends Plugin {
   settings: OwnSyncSettings = DEFAULT_SETTINGS;
   private pendingUpload: unknown = null;
   private pendingDownload: unknown = null;
+  private pendingPull: unknown = null;
   private confirmed: unknown = null;
   private mutationRunning = false;
   private saveChain: Promise<void> = Promise.resolve();
@@ -50,6 +51,7 @@ export default class OwnSyncPlugin extends Plugin {
     const saved = await this.loadData() as (Partial<OwnSyncSettings> & {
       pendingUpload?: unknown;
       pendingDownload?: unknown;
+      pendingPull?: unknown;
       confirmed?: unknown;
     }) | null;
     this.settings = {
@@ -59,6 +61,7 @@ export default class OwnSyncPlugin extends Plugin {
     };
     this.pendingUpload = saved?.pendingUpload ?? null;
     this.pendingDownload = saved?.pendingDownload ?? null;
+    this.pendingPull = saved?.pendingPull ?? null;
     this.confirmed = saved?.confirmed ?? null;
 
     this.addSettingTab(new OwnSyncSettingTab(this.app, this));
@@ -97,6 +100,11 @@ export default class OwnSyncPlugin extends Plugin {
       name: 'Push local test changes',
       callback: () => { void this.pushLocalChanges(); },
     });
+    this.addCommand({
+      id: 'pull-remote-changes',
+      name: 'Pull remote test changes',
+      callback: () => { void this.pullRemoteChanges(); },
+    });
   }
 
   async saveSettings(): Promise<void> {
@@ -104,6 +112,7 @@ export default class OwnSyncPlugin extends Plugin {
       ...this.settings,
       pendingUpload: this.pendingUpload,
       pendingDownload: this.pendingDownload,
+      pendingPull: this.pendingPull,
       confirmed: this.confirmed,
     };
     this.saveChain = this.saveChain.catch(() => {}).then(() => this.saveData(snapshot));
@@ -350,6 +359,10 @@ export default class OwnSyncPlugin extends Plugin {
       new Notice('Own Sync: finish the pending test download before uploading.');
       return;
     }
+    if (this.pendingPull !== null) {
+      new Notice('Own Sync: finish the pending remote pull before uploading.');
+      return;
+    }
     if (this.confirmed !== null && this.pendingUpload === null) {
       new Notice('Own Sync: initial upload is already confirmed. Use Push local test changes.');
       return;
@@ -418,6 +431,10 @@ export default class OwnSyncPlugin extends Plugin {
     }
     if (this.pendingUpload !== null) {
       new Notice('Own Sync: finish the pending test upload before downloading.');
+      return;
+    }
+    if (this.pendingPull !== null) {
+      new Notice('Own Sync: finish the pending remote pull before downloading.');
       return;
     }
     if (this.confirmed !== null && this.pendingDownload === null) {
@@ -526,6 +543,10 @@ export default class OwnSyncPlugin extends Plugin {
     }
     if (this.pendingDownload !== null) {
       new Notice('Own Sync: finish the pending test download before pushing changes.');
+      return;
+    }
+    if (this.pendingPull !== null) {
+      new Notice('Own Sync: finish the pending remote pull before pushing changes.');
       return;
     }
     if (this.pendingUpload !== null) {
@@ -649,6 +670,186 @@ export default class OwnSyncPlugin extends Plugin {
       new Notice('Own Sync: upload result unknown. Pending operation kept for an identical retry.');
     }
   }
+
+  async pullRemoteChanges(): Promise<void> {
+    if (this.mutationRunning) return;
+    this.mutationRunning = true;
+    try {
+      await this.pullRemoteChangesOnce();
+    } finally {
+      this.mutationRunning = false;
+    }
+  }
+
+  private async pullRemoteChangesOnce(): Promise<void> {
+    let connection: { baseUrl: string; vaultId: string; token: string };
+    let confirmed: ReturnType<typeof readConfirmedState>;
+    try {
+      connection = this.vaultConnection();
+      confirmed = readConfirmedState(this.confirmed);
+      if (confirmed.state.serverUrl !== connection.baseUrl ||
+        confirmed.state.vaultId !== connection.vaultId.toLowerCase()) {
+        throw new Error('Confirmed state belongs to another server or vault.');
+      }
+    } catch {
+      new Notice('Own Sync: no confirmed base for this vault. Complete the first test transfer.');
+      return;
+    }
+    if (this.pendingUpload !== null || this.pendingDownload !== null) {
+      new Notice('Own Sync: finish the pending upload or first download before pulling changes.');
+      return;
+    }
+
+    if (this.pendingPull === null) {
+      const endpoint = `${connection.baseUrl}/api/v0/vaults/${confirmed.state.vaultId}`;
+      const headers = { Authorization: `Bearer ${connection.token}` };
+      try {
+        const head = await requestUrl({ url: `${endpoint}/head`, method: 'GET', headers, throw: false });
+        if (head.status !== 200 || !Number.isSafeInteger(head.json?.current_revision) ||
+          head.json.current_revision < confirmed.state.revision) {
+          throw new Error('Invalid remote head.');
+        }
+        const revision: number = head.json.current_revision;
+        if (revision === confirmed.state.revision) {
+          new Notice(`Own Sync: already at confirmed revision ${revision}.`);
+          return;
+        }
+        if (revision - confirmed.state.revision > MAX_PREVIEW_REVISIONS) {
+          throw new PreviewLimitError('More than 100 remote revisions.');
+        }
+
+        const local = new Map<string, string>();
+        let scannedBytes = 0;
+        for (const file of this.app.vault.getFiles()) {
+          validateSyncPath(file.path);
+          scannedBytes += file.stat.size;
+          if (scannedBytes > MAX_PREVIEW_BYTES) throw new PreviewLimitError('Local vault exceeds 32 MiB.');
+          const bytes = new Uint8Array(await this.app.vault.readBinary(file));
+          scannedBytes += bytes.byteLength - file.stat.size;
+          if (scannedBytes > MAX_PREVIEW_BYTES) throw new PreviewLimitError('Local vault exceeds 32 MiB.');
+          local.set(file.path, await digestBytes(bytes));
+        }
+        if (local.size !== confirmed.digests.size ||
+          [...confirmed.digests].some(([path, digest]) => local.get(path) !== digest)) {
+          new Notice('Own Sync: local files differ from the confirmed base. Pull stopped; preview changes first.');
+          return;
+        }
+
+        const remote = new Map(confirmed.digests);
+        const remoteBytes = new Map<string, Uint8Array>();
+        let transferredBytes = 0;
+        for (let current = confirmed.state.revision + 1; current <= revision; current += 1) {
+          const response = await requestUrl({
+            url: `${endpoint}/commits/${current}`, method: 'GET', headers, throw: false,
+          });
+          if (response.status !== 200) throw new Error('Could not read a remote commit.');
+          transferredBytes += response.arrayBuffer.byteLength;
+          if (transferredBytes > MAX_PREVIEW_BYTES) {
+            throw new PreviewLimitError('Remote delta exceeds 32 MiB.');
+          }
+          const changes = await decodePacket(response.arrayBuffer);
+          await applyPacketToDigests(remote, response.arrayBuffer);
+          for (const change of changes) {
+            if (change.kind === 'put') remoteBytes.set(change.path, change.bytes);
+            else remoteBytes.delete(change.path);
+          }
+        }
+        assertNoCaseCollisions(remote.keys());
+        assertNoFileDirectoryCollisions(remote.keys());
+        const delta: FileChange[] = [];
+        for (const path of new Set([...confirmed.digests.keys(), ...remote.keys()])) {
+          if (confirmed.digests.get(path) === remote.get(path)) continue;
+          const digest = remote.get(path);
+          if (digest === undefined) delta.push({ path, kind: 'delete' });
+          else {
+            const bytes = remoteBytes.get(path);
+            if (bytes === undefined || await digestBytes(bytes) !== digest) {
+              throw new Error('Remote packet history is incomplete.');
+            }
+            delta.push({ path, kind: 'put', bytes });
+          }
+        }
+        if (delta.length === 0) {
+          const previousConfirmed = this.confirmed;
+          this.confirmed = advanceConfirmedRevision(previousConfirmed, revision);
+          try {
+            await this.saveSettings();
+            new Notice(`Own Sync: confirmed revision ${revision}; file contents already match.`);
+          } catch {
+            this.confirmed = previousConfirmed;
+            new Notice('Own Sync: could not save the confirmed revision. Files were not changed.');
+          }
+          return;
+        }
+        const packet = await encodePacket(delta);
+        this.pendingPull = createPendingPull(
+          connection.baseUrl, confirmed.state.vaultId, confirmed.state.revision, revision, packet,
+        );
+        try {
+          await this.saveSettings();
+        } catch {
+          this.pendingPull = null;
+          throw new Error('Could not save pending remote changes.');
+        }
+      } catch (error) {
+        new Notice(error instanceof PreviewLimitError
+          ? `Own Sync: ${error.message} No files changed.`
+          : 'Own Sync: could not prepare the remote pull. No files changed.');
+        return;
+      }
+    }
+
+    try {
+      const { pending, changes } = await readPendingPull(this.pendingPull);
+      if (pending.serverUrl !== connection.baseUrl || pending.vaultId !== confirmed.state.vaultId) {
+        new Notice('Own Sync: pending pull belongs to another server or vault. Restore its settings before retrying.');
+        return;
+      }
+      const nextConfirmed = await confirmedAfterPull(this.confirmed, pending);
+      const vault = this.app.vault;
+      await applyRemoteChanges({
+        listPaths: () => vault.getFiles().map((file) => file.path),
+        read: async (path) => {
+          const file = vault.getAbstractFileByPath(path);
+          if (file === null) return null;
+          if (file instanceof TFolder) return null;
+          if (!(file instanceof TFile)) throw new Error('Unsupported vault entry.');
+          return new Uint8Array(await vault.readBinary(file));
+        },
+        ensureFolder: async (path) => {
+          const existing = vault.getAbstractFileByPath(path);
+          if (existing === null) await vault.createFolder(path);
+          else if (!(existing instanceof TFolder)) throw new Error('File conflicts with a remote folder.');
+        },
+        put: async (path, bytes) => {
+          const existing = vault.getAbstractFileByPath(path);
+          const data = new Uint8Array(bytes).buffer;
+          if (existing === null) await vault.createBinary(path, data);
+          else if (existing instanceof TFile) await vault.modifyBinary(existing, data);
+          else throw new Error('Folder conflicts with a remote file.');
+        },
+        remove: async (path) => {
+          const existing = vault.getAbstractFileByPath(path);
+          if (existing === null) return;
+          if (!(existing instanceof TFile)) throw new Error('Folder conflicts with a remote deletion.');
+          await this.app.fileManager.trashFile(existing);
+        },
+      }, confirmed.digests, changes);
+      const previousConfirmed = this.confirmed;
+      this.confirmed = nextConfirmed;
+      this.pendingPull = null;
+      try {
+        await this.saveSettings();
+        new Notice(`Own Sync: pulled test changes through revision ${nextConfirmed.revision}.`);
+      } catch {
+        this.confirmed = previousConfirmed;
+        this.pendingPull = pending;
+        new Notice('Own Sync: files changed, but confirmation could not be saved. Retry the pull.');
+      }
+    } catch {
+      new Notice('Own Sync: remote pull stopped. Pending packet kept; retry after checking local files.');
+    }
+  }
 }
 
 class OwnSyncSettingTab extends PluginSettingTab {
@@ -753,6 +954,15 @@ class OwnSyncSettingTab extends PluginSettingTab {
         .setButtonText('Push local changes')
         .onClick(async () => {
           await this.plugin.pushLocalChanges();
+        }));
+
+    new Setting(containerEl)
+      .setName('Pull remote test changes')
+      .setDesc('After the first transfer, apply later server changes only when local files match the confirmed base. Deleted files go to the Obsidian trash; an interrupted pull can be retried.')
+      .addButton((button) => button
+        .setButtonText('Pull remote changes')
+        .onClick(async () => {
+          await this.plugin.pullRemoteChanges();
         }));
   }
 }
