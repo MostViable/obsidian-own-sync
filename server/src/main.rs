@@ -37,13 +37,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Some(command) if command == "provision" => {
             let db_path = arguments.next().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "provision needs a database path")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "provision needs a database path",
+                )
             })?;
             let owner_credentials_path = arguments.next().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "provision needs owner credentials path")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "provision needs owner credentials path",
+                )
             })?;
             let device_credentials_path = arguments.next().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "provision needs device credentials path")
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "provision needs device credentials path",
+                )
             })?;
             if arguments.next().is_some() {
                 return Err(io::Error::new(

@@ -121,9 +121,7 @@ fn read_credentials(path: &Path) -> Result<Credentials, Box<dyn Error>> {
 fn decode_fixed<const N: usize>(value: &str, field: &str) -> Result<[u8; N], Box<dyn Error>> {
     let mut bytes = [0_u8; N];
     hex::decode_to_slice(value, &mut bytes)
-        .map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("invalid {field}"))
-        })?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("invalid {field}")))?;
     Ok(bytes)
 }
 
