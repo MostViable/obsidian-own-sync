@@ -97,7 +97,10 @@ pub fn provision_device(
         vault_id: owner.vault_id,
         token: hex::encode(token.0),
     };
-    write_credentials(device_credentials_path, &credentials)?;
+    if let Err(error) = write_credentials(device_credentials_path, &credentials) {
+        let _ = store.revoke_device(&owner_token, device_id);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -276,5 +279,19 @@ mod tests {
 
         assert!(provision_device(&db_path, &forged_owner_path, &second_path).is_err());
         assert!(!second_path.exists());
+    }
+
+    #[test]
+    fn provision_revokes_new_token_when_credentials_cannot_be_written() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("sync.sqlite");
+        let owner_path = directory.path().join("device.json");
+        let missing_parent = directory.path().join("missing").join("second-device.json");
+        bootstrap(&db_path, &owner_path).unwrap();
+
+        assert!(provision_device(&db_path, &owner_path, &missing_parent).is_err());
+        let store = SqliteStore::open_existing(&db_path).unwrap();
+        let active_devices: i64 = store.active_device_count_for_test().unwrap();
+        assert_eq!(active_devices, 1);
     }
 }
