@@ -136,6 +136,7 @@ export default class OwnSyncPlugin extends Plugin {
         if (!document.hidden) this.scheduleAutoSync(0);
       });
       this.registerDomEvent(window, 'online', () => this.scheduleAutoSync(0));
+      this.registerInterval(window.setInterval(() => this.scheduleAutoSync(0), 30000));
       this.scheduleAutoSync(0);
     });
   }
@@ -232,14 +233,16 @@ export default class OwnSyncPlugin extends Plugin {
         this.syncStatus === 'conflict') return;
     }
     await this.pullRemoteChangesOnce();
-    if (this.syncStatus === 'setup' || this.syncStatus === 'error' || this.syncStatus === 'conflict') return;
+    if (this.syncStatus !== 'synced') return;
     if (this.pendingPull !== null || this.pendingUpload !== null) {
       this.updateStatus('queued');
       return;
     }
+    this.updateStatus('syncing');
     await this.pushLocalChangesOnce();
-    if (this.pendingUpload !== null && this.syncStatus === 'syncing') this.updateStatus('queued');
-    else if (this.syncStatus === 'syncing') this.updateStatus('synced');
+    const status = this.syncStatus as SyncStatus;
+    if (this.pendingUpload !== null && status === 'syncing') this.updateStatus('queued');
+    else if (status === 'syncing') this.updateStatus('synced');
   }
 
   async saveSettings(): Promise<void> {
@@ -285,6 +288,7 @@ export default class OwnSyncPlugin extends Plugin {
     try {
       connection = this.vaultConnection();
     } catch (error) {
+      this.updateStatus('error');
       new Notice(`Own Sync: ${(error as Error).message}`);
       return;
     }
@@ -331,6 +335,7 @@ export default class OwnSyncPlugin extends Plugin {
     try {
       connection = this.vaultConnection();
     } catch (error) {
+      this.updateStatus('error');
       new Notice(`Own Sync: ${(error as Error).message}`);
       return;
     }
@@ -860,10 +865,12 @@ export default class OwnSyncPlugin extends Plugin {
     try {
       connection = this.vaultConnection();
     } catch (error) {
+      this.updateStatus('error');
       new Notice(`Own Sync: ${(error as Error).message}`);
       return;
     }
     if (this.pendingDownload !== null || this.pendingUpload === null) {
+      this.updateStatus('queued');
       new Notice('Own Sync: reconciliation needs a pending test upload and no first download.');
       return;
     }
@@ -873,6 +880,7 @@ export default class OwnSyncPlugin extends Plugin {
         if (pending.rebaseOperationId === undefined) throw new Error('Not a pending rebase.');
         await this.pullRemoteChangesOnce(pending.rebaseOperationId);
       } catch {
+        this.updateStatus('error');
         new Notice('Own Sync: saved reconciliation is invalid. Pending operations were kept.');
       }
       return;
@@ -887,6 +895,7 @@ export default class OwnSyncPlugin extends Plugin {
       }
       operationId = pending.operationId;
     } catch {
+      this.updateStatus('error');
       new Notice('Own Sync: pending upload has no valid confirmed base for reconciliation.');
       return;
     }
@@ -921,6 +930,7 @@ export default class OwnSyncPlugin extends Plugin {
         throw new Error('Confirmed state belongs to another server or vault.');
       }
     } catch {
+      this.updateStatus('setup');
       new Notice('Own Sync: no confirmed base for this vault. Complete the first test transfer.');
       return;
     }
@@ -962,6 +972,7 @@ export default class OwnSyncPlugin extends Plugin {
           try {
             await queuedUploadDigests(this.confirmed, pending, local);
           } catch {
+            this.updateStatus('conflict');
             new Notice('Own Sync: local files changed after the queued upload. Pending upload kept; no rebase started.');
             return;
           }
@@ -1014,6 +1025,7 @@ export default class OwnSyncPlugin extends Plugin {
             try {
               await queuedUploadDigests(this.confirmed, previousUpload, current);
             } catch {
+              this.updateStatus('conflict');
               new Notice('Own Sync: local files changed during rebase. Pending upload kept.');
               return;
             }
@@ -1026,9 +1038,11 @@ export default class OwnSyncPlugin extends Plugin {
           } catch {
             this.confirmed = previousConfirmed;
             this.pendingUpload = previousUpload;
+            this.updateStatus('error');
             new Notice('Own Sync: could not save the confirmed revision. Files were not changed.');
             return;
           }
+          this.updateStatus('synced');
           new Notice(`Own Sync: confirmed revision ${revision}; file contents already match.`);
           if (rebaseOperationId !== undefined) {
             try { await this.pushLocalChangesOnce(); }
@@ -1130,6 +1144,7 @@ export default class OwnSyncPlugin extends Plugin {
         this.confirmed = previousConfirmed;
         this.pendingPull = pending;
         this.pendingUpload = previousUpload;
+        this.updateStatus('error');
         new Notice('Own Sync: files changed, but confirmation could not be saved. Retry the pull.');
         return;
       }

@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  server:
+    name: Server (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@cross
+      - name: Build server
+        run: cross build --locked --release --manifest-path server/Cargo.toml --target ${{ matrix.target }}
+      - name: Package server
+        run: |
+          mkdir -p "dist/own-sync-server-${{ matrix.target }}"
+          cp "server/target/${{ matrix.target }}/release/own-sync-server" "dist/own-sync-server-${{ matrix.target }}/"
+          cp docs/BOOTSTRAP.md docs/PROTOCOL_V0.md docs/VPS.md "dist/own-sync-server-${{ matrix.target }}/"
+          cp deploy/own-sync.service deploy/Caddyfile.example "dist/own-sync-server-${{ matrix.target }}/"
+          tar -C dist -czf "dist/own-sync-server-${{ matrix.target }}.tar.gz" "own-sync-server-${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: own-sync-server-${{ matrix.target }}
+          path: dist/own-sync-server-${{ matrix.target }}.tar.gz
+
+  plugin:
+    name: Plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Package plugin
+        run: |
+          mkdir -p dist/own-sync-plugin
+          cp manifest.json main.js dist/own-sync-plugin/
+          tar -C dist -czf dist/own-sync-plugin.tar.gz own-sync-plugin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: own-sync-plugin
+          path: dist/own-sync-plugin.tar.gz
+
+  publish:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [server, plugin]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: own-sync-*
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*.tar.gz
