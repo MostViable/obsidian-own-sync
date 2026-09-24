@@ -1,4 +1,10 @@
-use std::{error::Error, fmt, path::Path, time::Duration};
+use std::{
+    error::Error,
+    fmt,
+    fs,
+    path::Path,
+    time::Duration,
+};
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -22,6 +28,7 @@ pub struct BootstrapIdentity {
 #[derive(Debug)]
 pub enum StoreError {
     Database(rusqlite::Error),
+    Io(std::io::Error),
     Random(getrandom::Error),
     UnknownVault,
     Unauthorized,
@@ -39,6 +46,7 @@ impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Database(error) => write!(formatter, "SQLite error: {error}"),
+            Self::Io(error) => write!(formatter, "filesystem error: {error}"),
             Self::Random(error) => write!(formatter, "system random source failed: {error}"),
             Self::UnknownVault => write!(formatter, "vault does not exist"),
             Self::Unauthorized => write!(formatter, "device has no access to this vault"),
@@ -69,6 +77,7 @@ impl Error for StoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Database(error) => Some(error),
+            Self::Io(error) => Some(error),
             Self::Random(error) => Some(error),
             _ => None,
         }
@@ -78,6 +87,12 @@ impl Error for StoreError {
 impl From<rusqlite::Error> for StoreError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Database(error)
+    }
+}
+
+impl From<std::io::Error> for StoreError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
     }
 }
 
@@ -189,6 +204,41 @@ impl SqliteStore {
              VALUES (?1, ?2, ?3)",
             params![&device_id.0[..], &user_id.0[..], &token.digest()[..]],
         )?;
+        Ok((device_id, token))
+    }
+
+    /// Issues a device only when the credential token belongs to the declared
+    /// user and that user is an owner of the requested vault.
+    pub fn issue_device_for_owner(
+        &mut self,
+        owner_token: &DeviceToken,
+        user_id: UserId,
+        vault_id: VaultId,
+    ) -> Result<(DeviceId, DeviceToken), StoreError> {
+        let device_id = DeviceId(random_id()?);
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes)?;
+        let token = DeviceToken(bytes);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let token_user: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT user_id FROM devices WHERE token_hash = ?1 AND revoked = 0",
+                params![&owner_token.digest()[..]],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if token_user.as_deref() != Some(&user_id.0[..]) {
+            return Err(StoreError::Unauthorized);
+        }
+        authorize(&transaction, owner_token, vault_id, RequiredRole::Owner)?;
+        transaction.execute(
+            "INSERT INTO devices (device_id, user_id, token_hash)
+             VALUES (?1, ?2, ?3)",
+            params![&device_id.0[..], &user_id.0[..], &token.digest()[..]],
+        )?;
+        transaction.commit()?;
         Ok((device_id, token))
     }
 
@@ -472,9 +522,41 @@ impl SqliteStore {
             return Err(StoreError::BackupDestinationExists);
         }
         let destination = destination.to_str().ok_or(StoreError::InvalidBackupPath)?;
-        self.connection
-            .execute("VACUUM INTO ?1", params![destination])?;
-        Ok(())
+        let parent = Path::new(destination)
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let temporary = tempfile::Builder::new()
+            .prefix(".own-sync-backup-")
+            .tempfile_in(parent)?;
+        let temporary_path = temporary.path().to_path_buf();
+        let temporary_path_guard = temporary.into_temp_path();
+        fs::remove_file(&temporary_path)?;
+
+        let vacuum_result = temporary_path
+            .to_str()
+            .ok_or(StoreError::InvalidBackupPath)
+            .and_then(|path| {
+                self.connection
+                    .execute("VACUUM INTO ?1", params![path])
+                    .map(|_| ())
+                    .map_err(StoreError::from)
+            });
+        if let Err(error) = vacuum_result {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+
+        let result = match fs::hard_link(&temporary_path, destination) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(StoreError::BackupDestinationExists)
+            }
+            Err(error) => Err(StoreError::Io(error)),
+        };
+        let cleanup_result = fs::remove_file(&temporary_path);
+        drop(temporary_path_guard);
+        result.and(cleanup_result.map_err(StoreError::from))
     }
 
     #[cfg(test)]
