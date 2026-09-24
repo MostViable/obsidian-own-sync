@@ -18,6 +18,8 @@ use crate::{
 };
 
 pub const MAX_PACKET_BYTES: usize = 1024 * 1024;
+pub const PROTOCOL_VERSION: u32 = 0;
+pub const PACKET_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone)]
 struct ApiState {
@@ -31,6 +33,7 @@ pub fn router(db_path: Option<PathBuf>) -> Router {
     };
 
     let vaults = Router::new()
+        .route("/api/v0/capabilities", get(capabilities))
         .route("/api/v0/vaults/{vault_id}/head", get(head))
         .route(
             "/api/v0/vaults/{vault_id}/commits/{revision}",
@@ -53,6 +56,22 @@ struct Health {
 
 async fn health() -> Json<Health> {
     Json(Health { status: "ok" })
+}
+
+#[derive(Serialize)]
+struct Capabilities {
+    protocol_version: u32,
+    packet_format_version: u32,
+    max_packet_bytes: usize,
+}
+
+async fn capabilities() -> Response {
+    no_store(Json(Capabilities {
+        protocol_version: PROTOCOL_VERSION,
+        packet_format_version: PACKET_FORMAT_VERSION,
+        max_packet_bytes: MAX_PACKET_BYTES,
+    })
+    .into_response())
 }
 
 #[derive(Serialize)]
@@ -315,6 +334,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn capabilities_report_protocol_and_limits() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sync.sqlite");
+        let app = router(Some(path));
+        let response = app
+            .oneshot(request(
+                Method::GET,
+                "/api/v0/capabilities",
+                None,
+                None,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = json(response).await;
+        assert_eq!(body["protocol_version"], PROTOCOL_VERSION);
+        assert_eq!(body["packet_format_version"], PACKET_FORMAT_VERSION);
+        assert_eq!(body["max_packet_bytes"], MAX_PACKET_BYTES);
     }
 
     #[tokio::test]

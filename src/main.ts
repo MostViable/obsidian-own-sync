@@ -1,6 +1,7 @@
 import { App, Notice, Plugin, PluginSettingTab, requestUrl, SecretComponent, Setting, TFile, TFolder } from 'obsidian';
 
 import { applyInitialSnapshot, applyRemoteChanges } from './sync/apply';
+import { assertCompatibleCapabilities } from './sync/capabilities';
 import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from './sync/plan';
 import { applyPacketToDigests, classifyUploadResponse, createPendingDownload, createPendingUpload, decodePacket, digestBytes, encodePacket, MAX_PACKET_BYTES, readPendingDownload, readPendingUpload, validateSyncPath, type FileChange } from './sync/packet';
 import { advanceConfirmedRevision, assertRebaseLocalFiles, changesFromLocal, confirmedAfterInitialDownload, confirmedAfterPull, confirmedAfterUpload, createPendingPull, planFromConfirmed, queuedUploadDigests, readConfirmedState, readPendingPull } from './sync/state';
@@ -226,6 +227,7 @@ export default class OwnSyncPlugin extends Plugin {
       this.updateStatus('setup');
       return;
     }
+    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
 
     if (this.pendingUpload !== null) {
       await this.reconcilePendingUploadOnce();
@@ -292,6 +294,7 @@ export default class OwnSyncPlugin extends Plugin {
       new Notice(`Own Sync: ${(error as Error).message}`);
       return;
     }
+    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
 
     try {
       const response = await requestUrl({
@@ -330,6 +333,21 @@ export default class OwnSyncPlugin extends Plugin {
     return { baseUrl, vaultId, token };
   }
 
+  private async requireServerCapabilities(baseUrl: string): Promise<boolean> {
+    try {
+      const response = await requestUrl({
+        url: `${baseUrl}/api/v0/capabilities`, method: 'GET', throw: false,
+      });
+      if (response.status !== 200) throw new Error('Server did not report protocol capabilities.');
+      assertCompatibleCapabilities(response.json);
+      return true;
+    } catch (error) {
+      this.updateStatus('error');
+      new Notice(`Own Sync: ${(error as Error).message}`);
+      return false;
+    }
+  }
+
   async previewFirstSync(): Promise<void> {
     let connection: { baseUrl: string; vaultId: string; token: string };
     try {
@@ -339,6 +357,7 @@ export default class OwnSyncPlugin extends Plugin {
       new Notice(`Own Sync: ${(error as Error).message}`);
       return;
     }
+    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
 
     const endpoint = `${connection.baseUrl}/api/v0/vaults/${connection.vaultId}`;
     const headers = { Authorization: `Bearer ${connection.token}` };
@@ -409,6 +428,7 @@ export default class OwnSyncPlugin extends Plugin {
       new Notice('Own Sync: no confirmed base for this vault. Complete the first test transfer.');
       return;
     }
+    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
 
     const endpoint = `${connection.baseUrl}/api/v0/vaults/${confirmed.state.vaultId}`;
     const headers = { Authorization: `Bearer ${connection.token}` };
@@ -494,6 +514,7 @@ export default class OwnSyncPlugin extends Plugin {
       new Notice(`Own Sync: ${(error as Error).message}`);
       return;
     }
+    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
     const vaultId = connection.vaultId.toLowerCase();
     const endpoint = `${connection.baseUrl}/api/v0/vaults/${vaultId}`;
     if (this.pendingDownload !== null) {
@@ -572,6 +593,7 @@ export default class OwnSyncPlugin extends Plugin {
       new Notice(`Own Sync: ${(error as Error).message}`);
       return;
     }
+    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
     if (this.pendingUpload !== null) {
       new Notice('Own Sync: finish the pending test upload before downloading.');
       return;
@@ -688,6 +710,7 @@ export default class OwnSyncPlugin extends Plugin {
       new Notice(`Own Sync: ${(error as Error).message}`);
       return;
     }
+    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
     if (this.pendingDownload !== null) {
       new Notice('Own Sync: finish the pending test download before pushing changes.');
       return;
@@ -869,6 +892,7 @@ export default class OwnSyncPlugin extends Plugin {
       new Notice(`Own Sync: ${(error as Error).message}`);
       return;
     }
+    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
     if (this.pendingDownload !== null || this.pendingUpload === null) {
       this.updateStatus('queued');
       new Notice('Own Sync: reconciliation needs a pending test upload and no first download.');
@@ -934,6 +958,7 @@ export default class OwnSyncPlugin extends Plugin {
       new Notice('Own Sync: no confirmed base for this vault. Complete the first test transfer.');
       return;
     }
+    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
     if (this.pendingDownload !== null ||
       (rebaseOperationId === undefined && this.pendingUpload !== null) ||
       (rebaseOperationId !== undefined && this.pendingUpload === null)) {
