@@ -3,7 +3,7 @@ import { App, Notice, Plugin, PluginSettingTab, requestUrl, SecretComponent, Set
 import { applyInitialSnapshot } from './sync/apply';
 import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from './sync/plan';
 import { applyPacketToDigests, createPendingDownload, createPendingUpload, digestBytes, encodePacket, MAX_PACKET_BYTES, readPendingDownload, readPendingUpload, validateSyncPath } from './sync/packet';
-import { changesFromLocal, confirmedAfterInitialDownload, confirmedAfterUpload, readConfirmedState } from './sync/state';
+import { changesFromLocal, confirmedAfterInitialDownload, confirmedAfterUpload, planFromConfirmed, readConfirmedState } from './sync/state';
 
 const MAX_PREVIEW_REVISIONS = 100;
 const MAX_PREVIEW_BYTES = 32 * 1024 * 1024;
@@ -76,6 +76,11 @@ export default class OwnSyncPlugin extends Plugin {
       id: 'preview-first-sync',
       name: 'Preview first sync',
       callback: () => { void this.previewFirstSync(); },
+    });
+    this.addCommand({
+      id: 'preview-confirmed-changes',
+      name: 'Preview changes since confirmed revision',
+      callback: () => { void this.previewConfirmedChanges(); },
     });
     this.addCommand({
       id: 'upload-test-vault',
@@ -233,6 +238,87 @@ export default class OwnSyncPlugin extends Plugin {
       const downloads = decisions.filter((decision) => decision.action === 'pull').length;
       const conflicts = decisions.filter((decision) => decision.action === 'conflict').length;
       new Notice(`Own Sync preview: ${uploads} uploads, ${downloads} downloads, ${conflicts} conflicts. No files changed.`, 15000);
+    } catch (error) {
+      new Notice(error instanceof PreviewLimitError
+        ? `Own Sync: ${error.message} No files changed.`
+        : 'Own Sync: preview failed or contains unsupported data. No files changed.');
+    }
+  }
+
+  async previewConfirmedChanges(): Promise<void> {
+    let connection: { baseUrl: string; vaultId: string; token: string };
+    let confirmed: ReturnType<typeof readConfirmedState>;
+    try {
+      connection = this.vaultConnection();
+      confirmed = readConfirmedState(this.confirmed);
+      if (confirmed.state.serverUrl !== connection.baseUrl ||
+        confirmed.state.vaultId !== connection.vaultId.toLowerCase()) {
+        throw new Error('Confirmed state belongs to another server or vault.');
+      }
+    } catch {
+      new Notice('Own Sync: no confirmed base for this vault. Complete the first test transfer.');
+      return;
+    }
+
+    const endpoint = `${connection.baseUrl}/api/v0/vaults/${confirmed.state.vaultId}`;
+    const headers = { Authorization: `Bearer ${connection.token}` };
+    try {
+      const head = await requestUrl({ url: `${endpoint}/head`, method: 'GET', headers, throw: false });
+      if (head.status !== 200 || !Number.isSafeInteger(head.json?.current_revision) ||
+        head.json.current_revision < 0) {
+        throw new Error('Could not read the remote head.');
+      }
+      const revision: number = head.json.current_revision;
+      if (revision < confirmed.state.revision) {
+        new Notice('Own Sync: server is behind the confirmed revision. No files changed.');
+        return;
+      }
+      if (revision - confirmed.state.revision > MAX_PREVIEW_REVISIONS) {
+        throw new PreviewLimitError('More than 100 remote revisions since the confirmed base.');
+      }
+
+      const remote = new Map(confirmed.digests);
+      let transferredBytes = 0;
+      for (let current = confirmed.state.revision + 1; current <= revision; current += 1) {
+        const response = await requestUrl({
+          url: `${endpoint}/commits/${current}`, method: 'GET', headers, throw: false,
+        });
+        if (response.status !== 200) throw new Error('Could not read a remote commit.');
+        transferredBytes += response.arrayBuffer.byteLength;
+        if (transferredBytes > MAX_PREVIEW_BYTES) {
+          throw new PreviewLimitError('Remote delta exceeds the 32 MiB test preview limit.');
+        }
+        await applyPacketToDigests(remote, response.arrayBuffer);
+      }
+
+      const local = new Map<string, string>();
+      let scannedBytes = 0;
+      for (const file of this.app.vault.getFiles()) {
+        validateSyncPath(file.path);
+        scannedBytes += file.stat.size;
+        if (scannedBytes > MAX_PREVIEW_BYTES) {
+          throw new PreviewLimitError('Local vault exceeds the 32 MiB test preview limit.');
+        }
+        const bytes = new Uint8Array(await this.app.vault.readBinary(file));
+        scannedBytes += bytes.byteLength - file.stat.size;
+        if (scannedBytes > MAX_PREVIEW_BYTES) {
+          throw new PreviewLimitError('Local vault exceeds the 32 MiB test preview limit.');
+        }
+        local.set(file.path, await digestBytes(bytes));
+      }
+
+      const decisions = planFromConfirmed(confirmed.digests, local, remote);
+      const uploads = decisions.filter((decision) => decision.action === 'push').length;
+      const downloads = decisions.filter((decision) => decision.action === 'pull').length;
+      const conflicts = decisions.filter((decision) => decision.action === 'conflict').length;
+      const paths = decisions.slice(0, 8).map((decision) => `${decision.action}: ${decision.path}`);
+      const remainder = decisions.length > paths.length ? `\n…and ${decisions.length - paths.length} more` : '';
+      const pending = this.pendingUpload === null ? '' : '\nPending upload remains queued.';
+      new Notice(
+        `Own Sync preview at revision ${revision}: ${uploads} uploads, ${downloads} downloads, ${conflicts} conflicts.` +
+        `${paths.length ? `\n${paths.join('\n')}` : ''}${remainder}${pending}\nNo files changed.`,
+        20000,
+      );
     } catch (error) {
       new Notice(error instanceof PreviewLimitError
         ? `Own Sync: ${error.message} No files changed.`
@@ -631,6 +717,15 @@ class OwnSyncSettingTab extends PluginSettingTab {
         .setButtonText('Preview first sync')
         .onClick(async () => {
           await this.plugin.previewFirstSync();
+        }));
+
+    new Setting(containerEl)
+      .setName('Changes since confirmed revision')
+      .setDesc('Compare local files with only the later server revisions and list proposed uploads, downloads and conflicts. Reads only; pending uploads remain queued.')
+      .addButton((button) => button
+        .setButtonText('Preview changes')
+        .onClick(async () => {
+          await this.plugin.previewConfirmedChanges();
         }));
 
     new Setting(containerEl)
