@@ -31,6 +31,8 @@ pub enum StoreError {
     UnsupportedSchema(i64),
     UnsupportedJournalMode(String),
     InconsistentState,
+    BackupDestinationExists,
+    InvalidBackupPath,
 }
 
 impl fmt::Display for StoreError {
@@ -55,6 +57,10 @@ impl fmt::Display for StoreError {
                 write!(formatter, "WAL journal mode is unavailable: {mode}")
             }
             Self::InconsistentState => write!(formatter, "stored revision state is inconsistent"),
+            Self::BackupDestinationExists => {
+                write!(formatter, "backup destination already exists")
+            }
+            Self::InvalidBackupPath => write!(formatter, "backup path is not valid UTF-8"),
         }
     }
 }
@@ -458,6 +464,17 @@ impl SqliteStore {
         let payload = read_encrypted_payload(&transaction, vault_id, revision)?;
         transaction.commit()?;
         Ok(payload)
+    }
+
+    pub fn backup_to(&mut self, destination: impl AsRef<Path>) -> Result<(), StoreError> {
+        let destination = destination.as_ref();
+        if destination.symlink_metadata().is_ok() {
+            return Err(StoreError::BackupDestinationExists);
+        }
+        let destination = destination.to_str().ok_or(StoreError::InvalidBackupPath)?;
+        self.connection
+            .execute("VACUUM INTO ?1", params![destination])?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1012,6 +1029,31 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn backup_is_openable_as_a_restored_store() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sync.sqlite");
+        let backup = directory.path().join("sync-backup.sqlite");
+        let mut store = SqliteStore::open(&path).unwrap();
+        store.create_vault(vault(1)).unwrap();
+        store
+            .commit(vault(1), operation(1), 0, b"encrypted-packet")
+            .unwrap();
+        store.backup_to(&backup).unwrap();
+        drop(store);
+
+        let mut restored = SqliteStore::open_existing(&backup).unwrap();
+        assert_eq!(restored.current_revision(vault(1)).unwrap(), Some(1));
+        assert_eq!(
+            restored.encrypted_payload(vault(1), 1).unwrap(),
+            Some(b"encrypted-packet".to_vec())
+        );
+        assert!(matches!(
+            restored.backup_to(&backup),
+            Err(StoreError::BackupDestinationExists)
+        ));
     }
 
     #[test]
