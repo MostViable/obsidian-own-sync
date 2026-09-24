@@ -729,12 +729,6 @@ export default class OwnSyncPlugin extends Plugin {
           if (scannedBytes > MAX_PREVIEW_BYTES) throw new PreviewLimitError('Local vault exceeds 32 MiB.');
           local.set(file.path, await digestBytes(bytes));
         }
-        if (local.size !== confirmed.digests.size ||
-          [...confirmed.digests].some(([path, digest]) => local.get(path) !== digest)) {
-          new Notice('Own Sync: local files differ from the confirmed base. Pull stopped; preview changes first.');
-          return;
-        }
-
         const remote = new Map(confirmed.digests);
         const remoteBytes = new Map<string, Uint8Array>();
         let transferredBytes = 0;
@@ -756,6 +750,11 @@ export default class OwnSyncPlugin extends Plugin {
         }
         assertNoCaseCollisions(remote.keys());
         assertNoFileDirectoryCollisions(remote.keys());
+        const decisions = planFromConfirmed(confirmed.digests, local, remote);
+        if (decisions.some((decision) => decision.action === 'conflict')) {
+          new Notice('Own Sync: local and remote files conflict. Pull stopped; preview changes first.');
+          return;
+        }
         const delta: FileChange[] = [];
         for (const path of new Set([...confirmed.digests.keys(), ...remote.keys()])) {
           if (confirmed.digests.get(path) === remote.get(path)) continue;
@@ -958,7 +957,7 @@ class OwnSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Pull remote test changes')
-      .setDesc('After the first transfer, apply later server changes only when local files match the confirmed base. Deleted files go to the Obsidian trash; an interrupted pull can be retried.')
+      .setDesc('Apply later server changes while preserving independent local edits. Conflicting paths stop the pull. Deleted files follow your Obsidian trash preference; interrupted pulls can be retried.')
       .addButton((button) => button
         .setButtonText('Pull remote changes')
         .onClick(async () => {

@@ -155,8 +155,14 @@ export function changesFromLocal(base: ReadonlyMap<string, string>, local: Reado
 export function planFromConfirmed(
   base: ReadonlyMap<string, string>, local: ReadonlyMap<string, string>, remote: ReadonlyMap<string, string>,
 ): SyncDecision[] {
-  const currentPaths = new Set([...local.keys(), ...remote.keys()]);
-  assertNoCaseCollisions(currentPaths);
-  assertNoFileDirectoryCollisions(currentPaths);
-  return planSync(base, local, remote);
+  const decisions = planSync(base, local, remote);
+  const finalPaths = new Set(local.keys());
+  for (const decision of decisions) {
+    if (decision.action !== 'pull') continue;
+    if (remote.has(decision.path)) finalPaths.add(decision.path);
+    else finalPaths.delete(decision.path);
+  }
+  assertNoCaseCollisions(finalPaths);
+  assertNoFileDirectoryCollisions(finalPaths);
+  return decisions;
 }

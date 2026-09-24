@@ -264,6 +264,14 @@ test('confirmed preview rejects paths that cannot safely coexist', () => {
     map([['parent.md/child.md', 'remote']])));
 });
 
+test('confirmed preview accepts a remote file becoming a folder', () => {
+  assert.deepEqual(planFromConfirmed(map([['parent.md', 'old']]),
+    map([['parent.md', 'old']]), map([['parent.md/child.md', 'new']])), [
+    { path: 'parent.md', action: 'pull' },
+    { path: 'parent.md/child.md', action: 'pull' },
+  ]);
+});
+
 test('pending remote pull advances the confirmed base only after validated changes', async () => {
   const first = await encodePacket([
     { path: 'a.md', kind: 'put', bytes: new Uint8Array([1]) },
@@ -368,4 +376,32 @@ test('remote pull can replace a file with a folder and resume', async () => {
   await applyRemoteChanges(store, base, changes);
   assert.ok(folders.has('parent.md'));
   assert.deepEqual(files.get('parent.md/child.md'), new Uint8Array([2]));
+});
+
+test('remote pull keeps an independent offline edit for a later push', async () => {
+  const old = await digestBytes(new Uint8Array([1]));
+  const localEdit = new Uint8Array([2]);
+  const remoteEdit = new Uint8Array([3]);
+  const base = map([['local.md', old], ['remote.md', old]]);
+  const files = map([['local.md', localEdit], ['remote.md', new Uint8Array([1])]]);
+  const remote = map([['local.md', old], ['remote.md', await digestBytes(remoteEdit)]]);
+  const localDigests = map([['local.md', await digestBytes(localEdit)], ['remote.md', old]]);
+  assert.deepEqual(planFromConfirmed(base, localDigests, remote), [
+    { path: 'local.md', action: 'push' },
+    { path: 'remote.md', action: 'pull' },
+  ]);
+  const store = {
+    listPaths: () => [...files.keys()],
+    read: async (path) => files.get(path) ?? null,
+    ensureFolder: async () => {},
+    put: async (path, bytes) => { files.set(path, new Uint8Array(bytes)); },
+    remove: async (path) => { files.delete(path); },
+  };
+  await applyRemoteChanges(store, base, [{ path: 'remote.md', kind: 'put', bytes: remoteEdit }]);
+  assert.deepEqual(files.get('local.md'), localEdit);
+  assert.deepEqual(files.get('remote.md'), remoteEdit);
+  assert.deepEqual(changesFromLocal(remote, map([
+    ['local.md', { digest: await digestBytes(files.get('local.md')), bytes: files.get('local.md') }],
+    ['remote.md', { digest: await digestBytes(files.get('remote.md')), bytes: files.get('remote.md') }],
+  ])), [{ path: 'local.md', kind: 'put', bytes: localEdit }]);
 });
