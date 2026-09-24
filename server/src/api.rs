@@ -66,12 +66,14 @@ struct Capabilities {
 }
 
 async fn capabilities() -> Response {
-    no_store(Json(Capabilities {
-        protocol_version: PROTOCOL_VERSION,
-        packet_format_version: PACKET_FORMAT_VERSION,
-        max_packet_bytes: MAX_PACKET_BYTES,
-    })
-    .into_response())
+    no_store(
+        Json(Capabilities {
+            protocol_version: PROTOCOL_VERSION,
+            packet_format_version: PACKET_FORMAT_VERSION,
+            max_packet_bytes: MAX_PACKET_BYTES,
+        })
+        .into_response(),
+    )
 }
 
 #[derive(Serialize)]
