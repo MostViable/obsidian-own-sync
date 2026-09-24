@@ -2,6 +2,7 @@ import { App, Notice, Plugin, PluginSettingTab, requestUrl, SecretComponent, Set
 
 import { applyInitialSnapshot, applyRemoteChanges } from './sync/apply';
 import { assertCompatibleCapabilities } from './sync/capabilities';
+import { isSyncableVaultPath } from './sync/files';
 import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from './sync/plan';
 import { applyPacketToDigests, classifyUploadResponse, createPendingDownload, createPendingUpload, decodePacket, digestBytes, encodePacket, MAX_PACKET_BYTES, readPendingDownload, readPendingUpload, validateSyncPath, type FileChange } from './sync/packet';
 import { advanceConfirmedRevision, assertRebaseLocalFiles, changesFromLocal, confirmedAfterInitialDownload, confirmedAfterPull, confirmedAfterUpload, createPendingPull, planFromConfirmed, queuedUploadDigests, readConfirmedState, readPendingPull } from './sync/state';
@@ -392,7 +393,7 @@ export default class OwnSyncPlugin extends Plugin {
 
       const local = new Map<string, string>();
       let scannedBytes = 0;
-      for (const file of this.app.vault.getFiles()) {
+      for (const file of this.app.vault.getFiles().filter((file) => isSyncableVaultPath(file.path))) {
         validateSyncPath(file.path);
         scannedBytes += file.stat.size;
         if (scannedBytes > MAX_PREVIEW_BYTES) {
@@ -463,7 +464,7 @@ export default class OwnSyncPlugin extends Plugin {
 
       const local = new Map<string, string>();
       let scannedBytes = 0;
-      for (const file of this.app.vault.getFiles()) {
+      for (const file of this.app.vault.getFiles().filter((file) => isSyncableVaultPath(file.path))) {
         validateSyncPath(file.path);
         scannedBytes += file.stat.size;
         if (scannedBytes > MAX_PREVIEW_BYTES) {
@@ -539,7 +540,7 @@ export default class OwnSyncPlugin extends Plugin {
           new Notice('Own Sync: test upload needs an accessible empty server vault. No files sent.');
           return;
         }
-        const files = this.app.vault.getFiles();
+        const files = this.app.vault.getFiles().filter((file) => isSyncableVaultPath(file.path));
         if (files.length === 0) {
           new Notice('Own Sync: test vault has no visible files to upload.');
           return;
@@ -609,7 +610,7 @@ export default class OwnSyncPlugin extends Plugin {
     const vaultId = connection.vaultId.toLowerCase();
     const endpoint = `${connection.baseUrl}/api/v0/vaults/${vaultId}`;
     if (this.pendingDownload === null) {
-      if (this.app.vault.getFiles().length !== 0) {
+      if (this.app.vault.getFiles().some((file) => isSyncableVaultPath(file.path))) {
         new Notice('Own Sync: first download needs an empty local test vault. No files changed.');
         return;
       }
@@ -656,7 +657,7 @@ export default class OwnSyncPlugin extends Plugin {
       assertNoFileDirectoryCollisions(paths);
       const vault = this.app.vault;
       await applyInitialSnapshot({
-        listPaths: () => vault.getFiles().map((file) => file.path),
+        listPaths: () => vault.getFiles().filter((file) => isSyncableVaultPath(file.path)).map((file) => file.path),
         read: async (path) => {
           const file = vault.getAbstractFileByPath(path);
           if (file === null) return null;
@@ -751,7 +752,7 @@ export default class OwnSyncPlugin extends Plugin {
       }
       const local = new Map<string, { digest: string; bytes: Uint8Array }>();
       let scannedBytes = 0;
-      for (const file of this.app.vault.getFiles()) {
+      for (const file of this.app.vault.getFiles().filter((file) => isSyncableVaultPath(file.path))) {
         validateSyncPath(file.path);
         scannedBytes += file.stat.size;
         if (scannedBytes > MAX_PREVIEW_BYTES) {
@@ -931,7 +932,7 @@ export default class OwnSyncPlugin extends Plugin {
   private async scanLocalDigests(): Promise<Map<string, string>> {
     const local = new Map<string, string>();
     let scannedBytes = 0;
-    for (const file of this.app.vault.getFiles()) {
+    for (const file of this.app.vault.getFiles().filter((file) => isSyncableVaultPath(file.path))) {
       validateSyncPath(file.path);
       scannedBytes += file.stat.size;
       if (scannedBytes > MAX_PREVIEW_BYTES) throw new PreviewLimitError('Local vault exceeds 32 MiB.');
@@ -1127,7 +1128,7 @@ export default class OwnSyncPlugin extends Plugin {
       }
       const vault = this.app.vault;
       await applyRemoteChanges({
-        listPaths: () => vault.getFiles().map((file) => file.path),
+        listPaths: () => vault.getFiles().filter((file) => isSyncableVaultPath(file.path)).map((file) => file.path),
         read: async (path) => {
           const file = vault.getAbstractFileByPath(path);
           if (file === null) return null;

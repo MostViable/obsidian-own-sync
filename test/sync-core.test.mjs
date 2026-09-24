@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import { applyInitialSnapshot, applyRemoteChanges } from '../src/sync/apply.ts';
 import { assertCompatibleCapabilities } from '../src/sync/capabilities.ts';
+import { isSyncableVaultPath } from '../src/sync/files.ts';
 import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from '../src/sync/plan.ts';
 import { applyPacketToDigests, classifyUploadResponse, createPendingDownload, createPendingUpload, decodePacket, digestBytes, encodePacket, readPendingDownload, readPendingUpload, validateSyncPath } from '../src/sync/packet.ts';
 import { advanceConfirmedRevision, assertRebaseLocalFiles, changesFromLocal, confirmedAfterInitialDownload, confirmedAfterPull, confirmedAfterUpload, createPendingPull, planFromConfirmed, queuedUploadDigests, readConfirmedState, readPendingPull } from '../src/sync/state.ts';
@@ -22,6 +23,13 @@ test('rejects incompatible server capabilities before sync', () => {
   assert.throws(() => assertCompatibleCapabilities({
     protocol_version: 0, packet_format_version: 1, max_packet_bytes: 1024,
   }));
+});
+
+test('excludes Obsidian configuration from vault scans', () => {
+  assert.equal(isSyncableVaultPath('.obsidian/workspace.json'), false);
+  assert.equal(isSyncableVaultPath('.obsidian/plugins/own-sync/data.json'), false);
+  assert.equal(isSyncableVaultPath('notes/.obsidian.md'), true);
+  assert.equal(isSyncableVaultPath('note.md'), true);
 });
 
 test('plans independent offline changes without conflict', () => {
