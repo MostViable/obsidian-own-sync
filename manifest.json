@@ -1,0 +1,9 @@
+{
+  "id": "own-sync",
+  "name": "Own Sync",
+  "version": "0.1.0",
+  "minAppVersion": "1.0.0",
+  "description": "Self-hosted sync for Obsidian. Early development build; sync is not available yet.",
+  "author": "MostViable",
+  "isDesktopOnly": false
+}
