@@ -1,0 +1,25 @@
+[Unit]
+Description=Own Sync experimental server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=own-sync
+Group=own-sync
+WorkingDirectory=/var/lib/own-sync
+ExecStart=/opt/own-sync/own-sync-server
+Environment=OWN_SYNC_BIND=127.0.0.1:8787
+Environment=OWN_SYNC_EXPERIMENTAL_API=1
+Environment=OWN_SYNC_DB=/var/lib/own-sync/data/sync.sqlite
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/own-sync/data
+
+[Install]
+WantedBy=multi-user.target
