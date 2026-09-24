@@ -1,4 +1,4 @@
-import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from './plan.ts';
+import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync, type SyncDecision } from './plan.ts';
 import {
   applyPacketToDigests, digestBytes, readPendingDownload, readPendingUpload, validateSyncPath,
   type FileChange,
@@ -90,4 +90,13 @@ export function changesFromLocal(base: ReadonlyMap<string, string>, local: Reado
     const file = local.get(path);
     return file ? { path, kind: 'put' as const, bytes: file.bytes } : { path, kind: 'delete' as const };
   });
+}
+
+export function planFromConfirmed(
+  base: ReadonlyMap<string, string>, local: ReadonlyMap<string, string>, remote: ReadonlyMap<string, string>,
+): SyncDecision[] {
+  const currentPaths = new Set([...local.keys(), ...remote.keys()]);
+  assertNoCaseCollisions(currentPaths);
+  assertNoFileDirectoryCollisions(currentPaths);
+  return planSync(base, local, remote);
 }

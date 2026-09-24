@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { applyInitialSnapshot } from '../src/sync/apply.ts';
 import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from '../src/sync/plan.ts';
 import { applyPacketToDigests, createPendingDownload, createPendingUpload, decodePacket, digestBytes, encodePacket, readPendingDownload, readPendingUpload, validateSyncPath } from '../src/sync/packet.ts';
-import { changesFromLocal, confirmedAfterInitialDownload, confirmedAfterUpload, readConfirmedState } from '../src/sync/state.ts';
+import { changesFromLocal, confirmedAfterInitialDownload, confirmedAfterUpload, planFromConfirmed, readConfirmedState } from '../src/sync/state.ts';
 
 const map = (entries) => new Map(entries);
 
@@ -230,4 +230,36 @@ test('rejects corrupted confirmed digests and preserves old pending upload forma
   const confirmed = await confirmedAfterUpload(null, pending);
   confirmed.digests['x.md'] = 'bad';
   assert.throws(() => readConfirmedState(confirmed));
+});
+
+test('previews remote revisions against the confirmed base and local offline edits', async () => {
+  const old = await digestBytes(new Uint8Array([1]));
+  const localEdit = await digestBytes(new Uint8Array([2]));
+  const remoteEdit = await digestBytes(new Uint8Array([3]));
+  const base = map([['pull.md', old], ['conflict.md', old], ['deleted.md', old]]);
+  const local = map([
+    ['pull.md', old], ['conflict.md', localEdit], ['deleted.md', old], ['local.md', localEdit],
+  ]);
+  const remote = new Map(base);
+  const packet = await encodePacket([
+    { path: 'pull.md', kind: 'put', bytes: new Uint8Array([3]) },
+    { path: 'conflict.md', kind: 'put', bytes: new Uint8Array([3]) },
+    { path: 'deleted.md', kind: 'delete' },
+  ]);
+  await applyPacketToDigests(remote, packet.buffer);
+  assert.equal(remote.get('pull.md'), remoteEdit);
+  assert.deepEqual(planFromConfirmed(base, local, remote), [
+    { path: 'conflict.md', action: 'conflict' },
+    { path: 'deleted.md', action: 'pull' },
+    { path: 'local.md', action: 'push' },
+    { path: 'pull.md', action: 'pull' },
+  ]);
+  assert.equal(base.get('pull.md'), old);
+});
+
+test('confirmed preview rejects paths that cannot safely coexist', () => {
+  assert.throws(() => planFromConfirmed(map([]), map([['Notes/a.md', 'local']]),
+    map([['notes/b.md', 'remote']])));
+  assert.throws(() => planFromConfirmed(map([]), map([['parent.md', 'local']]),
+    map([['parent.md/child.md', 'remote']])));
 });
