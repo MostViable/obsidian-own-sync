@@ -3,7 +3,7 @@
   "name": "Own Sync",
   "version": "0.1.0",
   "minAppVersion": "1.11.4",
-  "description": "Self-hosted sync for Obsidian. Early development build; sync is not available yet.",
+  "description": "Experimental self-hosted sync for disposable test vaults. Unencrypted development build.",
   "author": "MostViable",
   "isDesktopOnly": false
 }
