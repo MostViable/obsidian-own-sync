@@ -3,8 +3,8 @@ import { test } from 'node:test';
 
 import { applyInitialSnapshot, applyRemoteChanges } from '../src/sync/apply.ts';
 import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from '../src/sync/plan.ts';
-import { applyPacketToDigests, createPendingDownload, createPendingUpload, decodePacket, digestBytes, encodePacket, readPendingDownload, readPendingUpload, validateSyncPath } from '../src/sync/packet.ts';
-import { advanceConfirmedRevision, changesFromLocal, confirmedAfterInitialDownload, confirmedAfterPull, confirmedAfterUpload, createPendingPull, planFromConfirmed, readConfirmedState, readPendingPull } from '../src/sync/state.ts';
+import { applyPacketToDigests, classifyUploadResponse, createPendingDownload, createPendingUpload, decodePacket, digestBytes, encodePacket, readPendingDownload, readPendingUpload, validateSyncPath } from '../src/sync/packet.ts';
+import { advanceConfirmedRevision, assertRebaseLocalFiles, changesFromLocal, confirmedAfterInitialDownload, confirmedAfterPull, confirmedAfterUpload, createPendingPull, planFromConfirmed, queuedUploadDigests, readConfirmedState, readPendingPull } from '../src/sync/state.ts';
 
 const map = (entries) => new Map(entries);
 
@@ -404,4 +404,75 @@ test('remote pull keeps an independent offline edit for a later push', async () 
     ['local.md', { digest: await digestBytes(files.get('local.md')), bytes: files.get('local.md') }],
     ['remote.md', { digest: await digestBytes(files.get('remote.md')), bytes: files.get('remote.md') }],
   ])), [{ path: 'local.md', kind: 'put', bytes: localEdit }]);
+});
+
+test('only a confirmed revision conflict allows rebasing a queued upload', () => {
+  assert.equal(classifyUploadResponse(201, { result: 'applied', revision: 2 }, 1), 'applied');
+  assert.equal(classifyUploadResponse(200, { result: 'replayed', revision: 2 }, 1), 'replayed');
+  assert.equal(classifyUploadResponse(409, { result: 'conflict', current_revision: 3 }, 1), 'conflict');
+  assert.equal(classifyUploadResponse(409, { error: 'operation_id_reused' }, 1), 'blocked');
+  assert.equal(classifyUploadResponse(409, { error: 'revision_exhausted' }, 1), 'blocked');
+  assert.equal(classifyUploadResponse(409, { result: 'conflict', current_revision: 1 }, 1), 'blocked');
+  assert.equal(classifyUploadResponse(200, { result: 'replayed', revision: 3 }, 1), 'blocked');
+  assert.equal(classifyUploadResponse(409, { result: 'conflict', current_revision: '3' }, 1), 'blocked');
+});
+
+test('queued upload rebase preserves independent edits and rejects changed local bytes', async () => {
+  const initial = await encodePacket([
+    { path: 'local.md', kind: 'put', bytes: new Uint8Array([1]) },
+    { path: 'remote.md', kind: 'put', bytes: new Uint8Array([1]) },
+  ]);
+  const base = await confirmedAfterUpload(null, createPendingUpload('https://sync.example.com', 'e'.repeat(32), initial));
+  const localEdit = new Uint8Array([2]);
+  const remoteEdit = new Uint8Array([3]);
+  const queued = createPendingUpload(base.serverUrl, base.vaultId,
+    await encodePacket([{ path: 'local.md', kind: 'put', bytes: localEdit }]), 1);
+  const desired = readConfirmedState(await confirmedAfterUpload(base, queued)).digests;
+  const local = new Map(desired);
+  assert.deepEqual(await queuedUploadDigests(base, queued, local), desired);
+  local.set('local.md', await digestBytes(new Uint8Array([9])));
+  await assert.rejects(queuedUploadDigests(base, queued, local));
+  const remote = map([
+    ['local.md', base.digests['local.md']],
+    ['remote.md', await digestBytes(remoteEdit)],
+  ]);
+  assert.deepEqual(planFromConfirmed(readConfirmedState(base).digests, desired, remote), [
+    { path: 'local.md', action: 'push' },
+    { path: 'remote.md', action: 'pull' },
+  ]);
+  const staged = createPendingPull(base.serverUrl, base.vaultId, 1, 2,
+    await encodePacket([{ path: 'remote.md', kind: 'put', bytes: remoteEdit }]), queued.operationId);
+  assert.equal((await readPendingPull(JSON.parse(JSON.stringify(staged)))).pending.rebaseOperationId,
+    queued.operationId);
+  assert.equal((await confirmedAfterPull(base, staged)).revision, 2);
+  await assert.rejects(readPendingPull({ ...staged, rebaseOperationId: 'invalid' }));
+  assert.deepEqual(planFromConfirmed(readConfirmedState(base).digests, desired,
+    map([['local.md', await digestBytes(new Uint8Array([4]))], ['remote.md', base.digests['remote.md']]])), [
+    { path: 'local.md', action: 'conflict' },
+  ]);
+});
+
+test('resumed rebase validates queued files before applying more remote changes', async () => {
+  const old = await digestBytes(new Uint8Array([1]));
+  const localEdit = await digestBytes(new Uint8Array([2]));
+  const remoteEdit = await digestBytes(new Uint8Array([3]));
+  const base = map([['local.md', old], ['remote.md', old]]);
+  const desired = map([['local.md', localEdit], ['remote.md', old]]);
+  const remote = map([['local.md', old], ['remote.md', remoteEdit]]);
+  const decisions = planFromConfirmed(base, desired, remote);
+  const changes = [{ path: 'remote.md', kind: 'put', bytes: new Uint8Array([3]) }];
+  const changed = await digestBytes(new Uint8Array([9]));
+
+  assert.doesNotThrow(() => assertRebaseLocalFiles(desired, remote, decisions, changes,
+    map([['local.md', localEdit], ['remote.md', old]]), true));
+  assert.doesNotThrow(() => assertRebaseLocalFiles(desired, remote, decisions, changes,
+    map([['local.md', localEdit], ['remote.md', remoteEdit]]), true));
+  assert.doesNotThrow(() => assertRebaseLocalFiles(desired, remote, decisions, changes,
+    map([['local.md', localEdit], ['remote.md', remoteEdit]]), false));
+  assert.throws(() => assertRebaseLocalFiles(desired, remote, decisions, changes,
+    map([['local.md', changed], ['remote.md', old]]), true));
+  assert.throws(() => assertRebaseLocalFiles(desired, remote, decisions, changes,
+    map([['local.md', localEdit], ['remote.md', old], ['new.md', localEdit]]), true));
+  assert.throws(() => assertRebaseLocalFiles(desired, remote, decisions, changes,
+    map([['local.md', localEdit], ['remote.md', old]]), false));
 });
