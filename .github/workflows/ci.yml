@@ -30,3 +30,5 @@ jobs:
       - run: cargo fmt --manifest-path server/Cargo.toml -- --check
       - run: cargo check --locked --manifest-path server/Cargo.toml
       - run: cargo test --locked --manifest-path server/Cargo.toml
+      - run: cargo build --locked --manifest-path server/Cargo.toml
+      - run: bash scripts/server-smoke.sh server/target/debug/own-sync-server
