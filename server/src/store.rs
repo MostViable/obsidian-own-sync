@@ -12,6 +12,13 @@ use crate::revision::{
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct VaultId(pub [u8; 16]);
 
+pub struct BootstrapIdentity {
+    pub user_id: UserId,
+    pub device_id: DeviceId,
+    pub vault_id: VaultId,
+    pub token: DeviceToken,
+}
+
 #[derive(Debug)]
 pub enum StoreError {
     Database(rusqlite::Error),
@@ -19,6 +26,7 @@ pub enum StoreError {
     UnknownVault,
     Unauthorized,
     LastOwner,
+    AlreadyInitialized,
     LegacyVaultsNeedOwner,
     UnsupportedSchema(i64),
     UnsupportedJournalMode(String),
@@ -33,6 +41,7 @@ impl fmt::Display for StoreError {
             Self::UnknownVault => write!(formatter, "vault does not exist"),
             Self::Unauthorized => write!(formatter, "device has no access to this vault"),
             Self::LastOwner => write!(formatter, "cannot remove the last vault owner"),
+            Self::AlreadyInitialized => write!(formatter, "store already has users or vaults"),
             Self::LegacyVaultsNeedOwner => {
                 write!(
                     formatter,
@@ -80,7 +89,19 @@ impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        Self::open_with_flags(path, flags)
+    }
+
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        Self::open_with_flags(path, flags)
+    }
+
+    fn open_with_flags(path: impl AsRef<Path>, flags: OpenFlags) -> Result<Self, StoreError> {
         let mut connection = Connection::open_with_flags(path, flags)?;
         connection.busy_timeout(Duration::from_secs(5))?;
 
@@ -95,6 +116,51 @@ impl SqliteStore {
         initialize_schema(&mut connection)?;
 
         Ok(Self { connection })
+    }
+
+    pub fn bootstrap_owner(&mut self) -> Result<BootstrapIdentity, StoreError> {
+        let user_id = UserId(random_id()?);
+        let device_id = DeviceId(random_id()?);
+        let vault_id = VaultId(random_id()?);
+        let mut token_bytes = [0_u8; 32];
+        getrandom::fill(&mut token_bytes)?;
+        let token = DeviceToken(token_bytes);
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing_records: i64 = transaction.query_row(
+            "SELECT (SELECT count(*) FROM users) + (SELECT count(*) FROM devices)
+                  + (SELECT count(*) FROM vaults) + (SELECT count(*) FROM commits)",
+            [],
+            |row| row.get(0),
+        )?;
+        if existing_records != 0 {
+            return Err(StoreError::AlreadyInitialized);
+        }
+        transaction.execute(
+            "INSERT INTO users (user_id) VALUES (?1)",
+            params![&user_id.0[..]],
+        )?;
+        transaction.execute(
+            "INSERT INTO devices (device_id, user_id, token_hash) VALUES (?1, ?2, ?3)",
+            params![&device_id.0[..], &user_id.0[..], &token.digest()[..]],
+        )?;
+        transaction.execute(
+            "INSERT INTO vaults (vault_id, current_revision) VALUES (?1, 0)",
+            params![&vault_id.0[..]],
+        )?;
+        transaction.execute(
+            "INSERT INTO vault_members (vault_id, user_id, role) VALUES (?1, ?2, 'owner')",
+            params![&vault_id.0[..], &user_id.0[..]],
+        )?;
+        transaction.commit()?;
+        Ok(BootstrapIdentity {
+            user_id,
+            device_id,
+            vault_id,
+            token,
+        })
     }
 
     pub fn create_user(&self) -> Result<UserId, StoreError> {
@@ -568,6 +634,37 @@ mod tests {
 
     fn operation(id: u8) -> OperationId {
         OperationId([id; 16])
+    }
+
+    #[test]
+    fn existing_open_does_not_create_a_missing_database() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("missing.sqlite");
+        assert!(SqliteStore::open_existing(&path).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn bootstrap_owner_runs_once_for_an_empty_store() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("sync.sqlite");
+        let mut store = SqliteStore::open(path).unwrap();
+        let identity = store.bootstrap_owner().unwrap();
+        assert_eq!(
+            store
+                .current_revision_for(&identity.token, identity.vault_id)
+                .unwrap(),
+            0
+        );
+        assert!(matches!(
+            store.bootstrap_owner(),
+            Err(StoreError::AlreadyInitialized)
+        ));
+        let users: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM users", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(users, 1);
     }
 
     #[test]
