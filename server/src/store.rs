@@ -1,10 +1,4 @@
-use std::{
-    error::Error,
-    fmt,
-    fs,
-    path::Path,
-    time::Duration,
-};
+use std::{error::Error, fmt, fs, path::Path, time::Duration};
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
