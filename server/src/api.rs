@@ -158,7 +158,7 @@ where
     F: FnOnce(&mut SqliteStore) -> Result<T, StoreError> + Send + 'static,
 {
     task::spawn_blocking(move || {
-        let mut store = SqliteStore::open(&*state.db_path)?;
+        let mut store = SqliteStore::open_existing(&*state.db_path)?;
         operation(&mut store)
     })
     .await
