@@ -432,6 +432,7 @@ name = "own-sync-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "getrandom",
  "rusqlite",
  "serde",
  "sha2",
