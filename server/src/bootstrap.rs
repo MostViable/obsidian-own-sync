@@ -89,8 +89,7 @@ pub fn provision_device(
     let owner_token = DeviceToken(decode_fixed::<32>(&owner.token, "token")?);
     let user_id = UserId(decode_fixed::<16>(&owner.user_id, "user_id")?);
     let vault_id = VaultId(decode_fixed::<16>(&owner.vault_id, "vault_id")?);
-    store.current_revision_for(&owner_token, vault_id)?;
-    let (device_id, token) = store.issue_device(user_id)?;
+    let (device_id, token) = store.issue_device_for_owner(&owner_token, user_id, vault_id)?;
     let credentials = Credentials {
         format_version: 1,
         user_id: owner.user_id,
@@ -260,5 +259,22 @@ mod tests {
         fs::write(&second_path, b"existing credentials").unwrap();
         assert!(provision_device(&db_path, &owner_path, &second_path).is_err());
         assert_eq!(fs::read(&second_path).unwrap(), b"existing credentials");
+    }
+
+    #[test]
+    fn provision_rejects_credentials_with_a_different_user_id() {
+        let directory = tempdir().unwrap();
+        let db_path = directory.path().join("sync.sqlite");
+        let owner_path = directory.path().join("device.json");
+        let forged_owner_path = directory.path().join("forged-owner.json");
+        let second_path = directory.path().join("second-device.json");
+        bootstrap(&db_path, &owner_path).unwrap();
+
+        let mut forged: Value = serde_json::from_reader(File::open(&owner_path).unwrap()).unwrap();
+        forged["user_id"] = Value::String("00".repeat(16));
+        fs::write(&forged_owner_path, serde_json::to_vec(&forged).unwrap()).unwrap();
+
+        assert!(provision_device(&db_path, &forged_owner_path, &second_path).is_err());
+        assert!(!second_path.exists());
     }
 }

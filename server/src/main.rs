@@ -77,10 +77,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         Some(command) if command == "backup" => {
             let db_path = arguments.next().ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "backup needs a database path",
-                )
+                io::Error::new(io::ErrorKind::InvalidInput, "backup needs a database path")
             })?;
             let backup_path = arguments.next().ok_or_else(|| {
                 io::Error::new(
