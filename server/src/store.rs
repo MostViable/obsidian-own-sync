@@ -1,5 +1,8 @@
 use std::{error::Error, fmt, fs, path::Path, time::Duration};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
@@ -524,42 +527,30 @@ impl SqliteStore {
         if destination.symlink_metadata().is_ok() {
             return Err(StoreError::BackupDestinationExists);
         }
-        let destination = destination.to_str().ok_or(StoreError::InvalidBackupPath)?;
-        let parent = Path::new(destination)
+        let parent = destination
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let temporary = tempfile::Builder::new()
+        let temporary_dir = tempfile::Builder::new()
             .prefix(".own-sync-backup-")
-            .tempfile_in(parent)?;
-        let temporary_path = temporary.path().to_path_buf();
-        let temporary_path_guard = temporary.into_temp_path();
-        fs::remove_file(&temporary_path)?;
+            .tempdir_in(parent)?;
+        let temporary_path = temporary_dir.path().join("backup.sqlite");
+        let temporary_text = temporary_path.to_str().ok_or(StoreError::InvalidBackupPath)?;
+        self.connection
+            .execute("VACUUM INTO ?1", params![temporary_text])?;
+        #[cfg(unix)]
+        fs::set_permissions(&temporary_path, fs::Permissions::from_mode(0o600))?;
+        fs::File::open(&temporary_path)?.sync_all()?;
 
-        let vacuum_result = temporary_path
-            .to_str()
-            .ok_or(StoreError::InvalidBackupPath)
-            .and_then(|path| {
-                self.connection
-                    .execute("VACUUM INTO ?1", params![path])
-                    .map(|_| ())
-                    .map_err(StoreError::from)
-            });
-        if let Err(error) = vacuum_result {
-            let _ = fs::remove_file(&temporary_path);
-            return Err(error);
-        }
-
-        let result = match fs::hard_link(&temporary_path, destination) {
+        match fs::hard_link(&temporary_path, destination) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 Err(StoreError::BackupDestinationExists)
             }
             Err(error) => Err(StoreError::Io(error)),
-        };
-        let cleanup_result = fs::remove_file(&temporary_path);
-        drop(temporary_path_guard);
-        result.and(cleanup_result.map_err(StoreError::from))
+        }?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -721,10 +712,14 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         sync::{mpsc, Arc, Barrier},
         thread,
         time::Duration,
     };
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     use tempfile::tempdir;
 
@@ -1139,6 +1134,11 @@ mod tests {
             restored.backup_to(&backup),
             Err(StoreError::BackupDestinationExists)
         ));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
