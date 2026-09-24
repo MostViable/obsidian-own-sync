@@ -19,6 +19,7 @@ export interface PendingPull {
   fromRevision: number;
   toRevision: number;
   packetText: string;
+  rebaseOperationId?: string;
 }
 
 const textEncoder = new TextEncoder();
@@ -26,12 +27,17 @@ const textDecoder = new TextDecoder('utf-8', { fatal: true });
 
 export function createPendingPull(
   serverUrl: string, vaultId: string, fromRevision: number, toRevision: number, packet: Uint8Array,
+  rebaseOperationId?: string,
 ): PendingPull {
   if (!Number.isSafeInteger(fromRevision) || fromRevision < 1 ||
-    !Number.isSafeInteger(toRevision) || toRevision <= fromRevision) {
+    !Number.isSafeInteger(toRevision) || toRevision <= fromRevision ||
+    (rebaseOperationId !== undefined && !/^[0-9a-f]{32}$/i.test(rebaseOperationId))) {
     throw new Error('Invalid pull revisions.');
   }
-  return { formatVersion: 1, serverUrl, vaultId, fromRevision, toRevision, packetText: textDecoder.decode(packet) };
+  return {
+    formatVersion: 1, serverUrl, vaultId, fromRevision, toRevision, packetText: textDecoder.decode(packet),
+    ...(rebaseOperationId === undefined ? {} : { rebaseOperationId }),
+  };
 }
 
 export async function readPendingPull(value: unknown): Promise<{ pending: PendingPull; changes: FileChange[]; body: ArrayBuffer }> {
@@ -42,7 +48,10 @@ export async function readPendingPull(value: unknown): Promise<{ pending: Pendin
     typeof candidate.fromRevision !== 'number' || !Number.isSafeInteger(candidate.fromRevision) ||
     candidate.fromRevision < 1 || typeof candidate.toRevision !== 'number' ||
     !Number.isSafeInteger(candidate.toRevision) || candidate.toRevision <= candidate.fromRevision ||
-    typeof candidate.packetText !== 'string' || Object.keys(candidate).length !== 6) {
+    typeof candidate.packetText !== 'string' ||
+    (candidate.rebaseOperationId !== undefined &&
+      (typeof candidate.rebaseOperationId !== 'string' || !/^[0-9a-f]{32}$/i.test(candidate.rebaseOperationId))) ||
+    Object.keys(candidate).length !== (candidate.rebaseOperationId === undefined ? 6 : 7)) {
     throw new Error('Invalid pending pull.');
   }
   const body = textEncoder.encode(candidate.packetText).buffer;
@@ -105,6 +114,16 @@ export async function confirmedAfterUpload(previous: unknown, pendingValue: unkn
   return makeConfirmedState(pending.serverUrl, pending.vaultId, expectedRevision + 1, digests);
 }
 
+export async function queuedUploadDigests(
+  previous: unknown, pendingValue: unknown, local: ReadonlyMap<string, string>,
+): Promise<Map<string, string>> {
+  const desired = readConfirmedState(await confirmedAfterUpload(previous, pendingValue)).digests;
+  if (local.size !== desired.size || [...desired].some(([path, digest]) => local.get(path) !== digest)) {
+    throw new Error('Local files changed after the queued upload.');
+  }
+  return desired;
+}
+
 export async function confirmedAfterInitialDownload(pendingValue: unknown): Promise<ConfirmedState> {
   const { pending, changes } = await readPendingDownload(pendingValue);
   const digests = new Map<string, string>();
@@ -165,4 +184,26 @@ export function planFromConfirmed(
   assertNoCaseCollisions(finalPaths);
   assertNoFileDirectoryCollisions(finalPaths);
   return decisions;
+}
+
+export function assertRebaseLocalFiles(
+  desired: ReadonlyMap<string, string>, remote: ReadonlyMap<string, string>,
+  decisions: readonly SyncDecision[], pulledChanges: readonly FileChange[],
+  local: ReadonlyMap<string, string>, allowPartialPull: boolean,
+): void {
+  const final = new Map(remote);
+  for (const decision of decisions) {
+    if (decision.action === 'conflict') throw new Error('Pending rebase has a conflicting path.');
+    if (decision.action !== 'push') continue;
+    const digest = desired.get(decision.path);
+    if (digest === undefined) final.delete(decision.path);
+    else final.set(decision.path, digest);
+  }
+  const pulledPaths = new Set(pulledChanges.map((change) => change.path));
+  for (const path of new Set([...desired.keys(), ...final.keys(), ...local.keys()])) {
+    const actual = local.get(path);
+    if (actual === final.get(path)) continue;
+    if (allowPartialPull && pulledPaths.has(path) && actual === desired.get(path)) continue;
+    throw new Error('Local files changed after the queued upload.');
+  }
 }

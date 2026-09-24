@@ -2,8 +2,8 @@ import { App, Notice, Plugin, PluginSettingTab, requestUrl, SecretComponent, Set
 
 import { applyInitialSnapshot, applyRemoteChanges } from './sync/apply';
 import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from './sync/plan';
-import { applyPacketToDigests, createPendingDownload, createPendingUpload, decodePacket, digestBytes, encodePacket, MAX_PACKET_BYTES, readPendingDownload, readPendingUpload, validateSyncPath, type FileChange } from './sync/packet';
-import { advanceConfirmedRevision, changesFromLocal, confirmedAfterInitialDownload, confirmedAfterPull, confirmedAfterUpload, createPendingPull, planFromConfirmed, readConfirmedState, readPendingPull } from './sync/state';
+import { applyPacketToDigests, classifyUploadResponse, createPendingDownload, createPendingUpload, decodePacket, digestBytes, encodePacket, MAX_PACKET_BYTES, readPendingDownload, readPendingUpload, validateSyncPath, type FileChange } from './sync/packet';
+import { advanceConfirmedRevision, assertRebaseLocalFiles, changesFromLocal, confirmedAfterInitialDownload, confirmedAfterPull, confirmedAfterUpload, createPendingPull, planFromConfirmed, queuedUploadDigests, readConfirmedState, readPendingPull } from './sync/state';
 
 const MAX_PREVIEW_REVISIONS = 100;
 const MAX_PREVIEW_BYTES = 32 * 1024 * 1024;
@@ -104,6 +104,11 @@ export default class OwnSyncPlugin extends Plugin {
       id: 'pull-remote-changes',
       name: 'Pull remote test changes',
       callback: () => { void this.pullRemoteChanges(); },
+    });
+    this.addCommand({
+      id: 'reconcile-pending-upload',
+      name: 'Reconcile pending test upload',
+      callback: () => { void this.reconcilePendingUpload(); },
     });
   }
 
@@ -617,7 +622,9 @@ export default class OwnSyncPlugin extends Plugin {
     await this.submitPendingUpload(connection);
   }
 
-  private async submitPendingUpload(connection: { baseUrl: string; vaultId: string; token: string }): Promise<void> {
+  private async submitPendingUpload(
+    connection: { baseUrl: string; vaultId: string; token: string }, quietConflict = false,
+  ): Promise<'confirmed' | 'conflict' | 'blocked'> {
     let pending: Awaited<ReturnType<typeof readPendingUpload>>['pending'];
     let body: ArrayBuffer;
     let nextConfirmed: Awaited<ReturnType<typeof confirmedAfterUpload>>;
@@ -625,12 +632,12 @@ export default class OwnSyncPlugin extends Plugin {
       ({ pending, body } = await readPendingUpload(this.pendingUpload));
       if (pending.serverUrl !== connection.baseUrl || pending.vaultId !== connection.vaultId.toLowerCase()) {
         new Notice('Own Sync: pending upload belongs to another server or vault. Restore its settings before retrying.');
-        return;
+        return 'blocked';
       }
       nextConfirmed = await confirmedAfterUpload(this.confirmed, pending);
     } catch {
       new Notice('Own Sync: pending upload or confirmed base is invalid. No request sent.');
-      return;
+      return 'blocked';
     }
 
     const expectedRevision = pending.expectedRevision ?? 0;
@@ -647,27 +654,33 @@ export default class OwnSyncPlugin extends Plugin {
         body,
         throw: false,
       });
-      const accepted = (response.status === 201 && response.json?.result === 'applied') ||
-        (response.status === 200 && response.json?.result === 'replayed');
-      if (accepted && response.json?.revision === expectedRevision + 1) {
+      const result = classifyUploadResponse(response.status, response.json, expectedRevision);
+      if (result === 'applied' || result === 'replayed') {
         const previousConfirmed = this.confirmed;
         this.confirmed = nextConfirmed;
         this.pendingUpload = null;
         try {
           await this.saveSettings();
           new Notice(`Own Sync: test changes confirmed at revision ${nextConfirmed.revision}.`);
+          return 'confirmed';
         } catch {
           this.confirmed = previousConfirmed;
           this.pendingUpload = pending;
           new Notice('Own Sync: server accepted changes, but local confirmation failed. Retry is safe.');
+          return 'blocked';
         }
-      } else if (response.status === 409) {
-        new Notice('Own Sync: server changed during upload. Pending operation kept; reconciliation is required.');
+      } else if (result === 'conflict') {
+        if (!quietConflict) {
+          new Notice('Own Sync: server changed during upload. Pending operation kept; reconciliation is required.');
+        }
+        return 'conflict';
       } else {
         new Notice(`Own Sync: server did not accept changes (HTTP ${response.status}). Pending operation kept.`);
+        return 'blocked';
       }
     } catch {
       new Notice('Own Sync: upload result unknown. Pending operation kept for an identical retry.');
+      return 'blocked';
     }
   }
 
@@ -681,7 +694,72 @@ export default class OwnSyncPlugin extends Plugin {
     }
   }
 
-  private async pullRemoteChangesOnce(): Promise<void> {
+  async reconcilePendingUpload(): Promise<void> {
+    if (this.mutationRunning) return;
+    this.mutationRunning = true;
+    try {
+      await this.reconcilePendingUploadOnce();
+    } finally {
+      this.mutationRunning = false;
+    }
+  }
+
+  private async reconcilePendingUploadOnce(): Promise<void> {
+    let connection: { baseUrl: string; vaultId: string; token: string };
+    try {
+      connection = this.vaultConnection();
+    } catch (error) {
+      new Notice(`Own Sync: ${(error as Error).message}`);
+      return;
+    }
+    if (this.pendingDownload !== null || this.pendingUpload === null) {
+      new Notice('Own Sync: reconciliation needs a pending test upload and no first download.');
+      return;
+    }
+    if (this.pendingPull !== null) {
+      try {
+        const { pending } = await readPendingPull(this.pendingPull);
+        if (pending.rebaseOperationId === undefined) throw new Error('Not a pending rebase.');
+        await this.pullRemoteChangesOnce(pending.rebaseOperationId);
+      } catch {
+        new Notice('Own Sync: saved reconciliation is invalid. Pending operations were kept.');
+      }
+      return;
+    }
+    let operationId: string;
+    try {
+      const { pending } = await readPendingUpload(this.pendingUpload);
+      const confirmed = readConfirmedState(this.confirmed);
+      if (pending.serverUrl !== connection.baseUrl || pending.vaultId !== connection.vaultId.toLowerCase() ||
+        (pending.expectedRevision ?? 0) !== confirmed.state.revision) {
+        throw new Error('Pending upload does not match the confirmed vault.');
+      }
+      operationId = pending.operationId;
+    } catch {
+      new Notice('Own Sync: pending upload has no valid confirmed base for reconciliation.');
+      return;
+    }
+    if (await this.submitPendingUpload(connection, true) === 'conflict') {
+      await this.pullRemoteChangesOnce(operationId);
+    }
+  }
+
+  private async scanLocalDigests(): Promise<Map<string, string>> {
+    const local = new Map<string, string>();
+    let scannedBytes = 0;
+    for (const file of this.app.vault.getFiles()) {
+      validateSyncPath(file.path);
+      scannedBytes += file.stat.size;
+      if (scannedBytes > MAX_PREVIEW_BYTES) throw new PreviewLimitError('Local vault exceeds 32 MiB.');
+      const bytes = new Uint8Array(await this.app.vault.readBinary(file));
+      scannedBytes += bytes.byteLength - file.stat.size;
+      if (scannedBytes > MAX_PREVIEW_BYTES) throw new PreviewLimitError('Local vault exceeds 32 MiB.');
+      local.set(file.path, await digestBytes(bytes));
+    }
+    return local;
+  }
+
+  private async pullRemoteChangesOnce(rebaseOperationId?: string): Promise<void> {
     let connection: { baseUrl: string; vaultId: string; token: string };
     let confirmed: ReturnType<typeof readConfirmedState>;
     try {
@@ -695,7 +773,9 @@ export default class OwnSyncPlugin extends Plugin {
       new Notice('Own Sync: no confirmed base for this vault. Complete the first test transfer.');
       return;
     }
-    if (this.pendingUpload !== null || this.pendingDownload !== null) {
+    if (this.pendingDownload !== null ||
+      (rebaseOperationId === undefined && this.pendingUpload !== null) ||
+      (rebaseOperationId !== undefined && this.pendingUpload === null)) {
       new Notice('Own Sync: finish the pending upload or first download before pulling changes.');
       return;
     }
@@ -718,16 +798,19 @@ export default class OwnSyncPlugin extends Plugin {
           throw new PreviewLimitError('More than 100 remote revisions.');
         }
 
-        const local = new Map<string, string>();
-        let scannedBytes = 0;
-        for (const file of this.app.vault.getFiles()) {
-          validateSyncPath(file.path);
-          scannedBytes += file.stat.size;
-          if (scannedBytes > MAX_PREVIEW_BYTES) throw new PreviewLimitError('Local vault exceeds 32 MiB.');
-          const bytes = new Uint8Array(await this.app.vault.readBinary(file));
-          scannedBytes += bytes.byteLength - file.stat.size;
-          if (scannedBytes > MAX_PREVIEW_BYTES) throw new PreviewLimitError('Local vault exceeds 32 MiB.');
-          local.set(file.path, await digestBytes(bytes));
+        const local = await this.scanLocalDigests();
+        if (rebaseOperationId !== undefined) {
+          const { pending } = await readPendingUpload(this.pendingUpload);
+          if (pending.operationId !== rebaseOperationId ||
+            (pending.expectedRevision ?? 0) !== confirmed.state.revision) {
+            throw new Error('Pending upload does not match the confirmed base.');
+          }
+          try {
+            await queuedUploadDigests(this.confirmed, pending, local);
+          } catch {
+            new Notice('Own Sync: local files changed after the queued upload. Pending upload kept; no rebase started.');
+            return;
+          }
         }
         const remote = new Map(confirmed.digests);
         const remoteBytes = new Map<string, Uint8Array>();
@@ -770,19 +853,38 @@ export default class OwnSyncPlugin extends Plugin {
         }
         if (delta.length === 0) {
           const previousConfirmed = this.confirmed;
-          this.confirmed = advanceConfirmedRevision(previousConfirmed, revision);
+          const previousUpload = this.pendingUpload;
+          if (rebaseOperationId !== undefined) {
+            const current = await this.scanLocalDigests();
+            try {
+              await queuedUploadDigests(this.confirmed, previousUpload, current);
+            } catch {
+              new Notice('Own Sync: local files changed during rebase. Pending upload kept.');
+              return;
+            }
+          }
+          const nextConfirmed = advanceConfirmedRevision(previousConfirmed, revision);
+          this.confirmed = nextConfirmed;
+          if (rebaseOperationId !== undefined) this.pendingUpload = null;
           try {
             await this.saveSettings();
-            new Notice(`Own Sync: confirmed revision ${revision}; file contents already match.`);
           } catch {
             this.confirmed = previousConfirmed;
+            this.pendingUpload = previousUpload;
             new Notice('Own Sync: could not save the confirmed revision. Files were not changed.');
+            return;
+          }
+          new Notice(`Own Sync: confirmed revision ${revision}; file contents already match.`);
+          if (rebaseOperationId !== undefined) {
+            try { await this.pushLocalChangesOnce(); }
+            catch { new Notice('Own Sync: rebase saved. Retry Push local changes to send remaining edits.'); }
           }
           return;
         }
         const packet = await encodePacket(delta);
         this.pendingPull = createPendingPull(
           connection.baseUrl, confirmed.state.vaultId, confirmed.state.revision, revision, packet,
+          rebaseOperationId,
         );
         try {
           await this.saveSettings();
@@ -804,7 +906,28 @@ export default class OwnSyncPlugin extends Plugin {
         new Notice('Own Sync: pending pull belongs to another server or vault. Restore its settings before retrying.');
         return;
       }
+      if (pending.rebaseOperationId !== rebaseOperationId) {
+        new Notice('Own Sync: pending pull belongs to a different operation. Use the matching retry command.');
+        return;
+      }
       const nextConfirmed = await confirmedAfterPull(this.confirmed, pending);
+      let rebaseState: {
+        desired: Map<string, string>;
+        remote: Map<string, string>;
+        decisions: ReturnType<typeof planFromConfirmed>;
+      } | null = null;
+      if (pending.rebaseOperationId !== undefined) {
+        const { pending: upload } = await readPendingUpload(this.pendingUpload);
+        if (upload.operationId !== pending.rebaseOperationId ||
+          (upload.expectedRevision ?? 0) !== confirmed.state.revision) {
+          throw new Error('Queued upload no longer matches the pending rebase.');
+        }
+        const desired = readConfirmedState(await confirmedAfterUpload(this.confirmed, upload)).digests;
+        const remote = readConfirmedState(nextConfirmed).digests;
+        const decisions = planFromConfirmed(confirmed.digests, desired, remote);
+        assertRebaseLocalFiles(desired, remote, decisions, changes, await this.scanLocalDigests(), true);
+        rebaseState = { desired, remote, decisions };
+      }
       const vault = this.app.vault;
       await applyRemoteChanges({
         listPaths: () => vault.getFiles().map((file) => file.path),
@@ -834,16 +957,28 @@ export default class OwnSyncPlugin extends Plugin {
           await this.app.fileManager.trashFile(existing);
         },
       }, confirmed.digests, changes);
+      if (rebaseState !== null) {
+        assertRebaseLocalFiles(rebaseState.desired, rebaseState.remote, rebaseState.decisions,
+          changes, await this.scanLocalDigests(), false);
+      }
       const previousConfirmed = this.confirmed;
+      const previousUpload = this.pendingUpload;
       this.confirmed = nextConfirmed;
       this.pendingPull = null;
+      if (pending.rebaseOperationId !== undefined) this.pendingUpload = null;
       try {
         await this.saveSettings();
-        new Notice(`Own Sync: pulled test changes through revision ${nextConfirmed.revision}.`);
       } catch {
         this.confirmed = previousConfirmed;
         this.pendingPull = pending;
+        this.pendingUpload = previousUpload;
         new Notice('Own Sync: files changed, but confirmation could not be saved. Retry the pull.');
+        return;
+      }
+      new Notice(`Own Sync: pulled test changes through revision ${nextConfirmed.revision}.`);
+      if (pending.rebaseOperationId !== undefined) {
+        try { await this.pushLocalChangesOnce(); }
+        catch { new Notice('Own Sync: rebase saved. Retry Push local changes to send remaining edits.'); }
       }
     } catch {
       new Notice('Own Sync: remote pull stopped. Pending packet kept; retry after checking local files.');
@@ -962,6 +1097,15 @@ class OwnSyncSettingTab extends PluginSettingTab {
         .setButtonText('Pull remote changes')
         .onClick(async () => {
           await this.plugin.pullRemoteChanges();
+        }));
+
+    new Setting(containerEl)
+      .setName('Reconcile pending test upload')
+      .setDesc('Retry a queued upload, then rebase it only if the server explicitly rejects the old revision and the local files still match the queued packet. Conflicting paths stay queued.')
+      .addButton((button) => button
+        .setButtonText('Reconcile upload')
+        .onClick(async () => {
+          await this.plugin.reconcilePendingUpload();
         }));
   }
 }

@@ -17,6 +17,24 @@ export interface PendingDownload {
   packetText: string;
 }
 
+export function classifyUploadResponse(
+  status: number, value: unknown, expectedRevision: number,
+): 'applied' | 'replayed' | 'conflict' | 'blocked' {
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+    !Number.isSafeInteger(expectedRevision) || expectedRevision < 0) return 'blocked';
+  const response = value as Record<string, unknown>;
+  if (status === 201 && response.result === 'applied' && response.revision === expectedRevision + 1) {
+    return 'applied';
+  }
+  if (status === 200 && response.result === 'replayed' && response.revision === expectedRevision + 1) {
+    return 'replayed';
+  }
+  if (status === 409 && response.result === 'conflict' &&
+    typeof response.current_revision === 'number' && Number.isSafeInteger(response.current_revision) &&
+    response.current_revision > expectedRevision) return 'conflict';
+  return 'blocked';
+}
+
 export type FileChange =
   | { path: string; kind: 'put'; bytes: Uint8Array }
   | { path: string; kind: 'delete' };
