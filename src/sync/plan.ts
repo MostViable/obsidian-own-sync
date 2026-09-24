@@ -6,13 +6,30 @@ export interface SyncDecision {
 }
 
 export function assertNoCaseCollisions(paths: Iterable<string>): void {
-  const seen = new Set<string>();
+  const seen = new Map<string, string>();
   for (const path of paths) {
-    const portable = path.toLowerCase();
-    if (seen.has(portable)) {
-      throw new Error('Paths collide on case-insensitive devices.');
+    const segments = path.split('/');
+    for (let index = 1; index <= segments.length; index += 1) {
+      const prefix = segments.slice(0, index).join('/');
+      const portable = prefix.toLowerCase();
+      const existing = seen.get(portable);
+      if (existing !== undefined && existing !== prefix) {
+        throw new Error('Paths collide on case-insensitive devices.');
+      }
+      seen.set(portable, prefix);
     }
-    seen.add(portable);
+  }
+}
+
+export function assertNoFileDirectoryCollisions(paths: Iterable<string>): void {
+  const files = new Set(paths);
+  for (const path of files) {
+    const segments = path.split('/');
+    for (let index = 1; index < segments.length; index += 1) {
+      if (files.has(segments.slice(0, index).join('/'))) {
+        throw new Error('A file conflicts with a parent directory.');
+      }
+    }
   }
 }
 

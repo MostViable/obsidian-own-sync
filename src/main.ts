@@ -1,7 +1,8 @@
-import { App, Notice, Plugin, PluginSettingTab, requestUrl, SecretComponent, Setting } from 'obsidian';
+import { App, Notice, Plugin, PluginSettingTab, requestUrl, SecretComponent, Setting, TFile, TFolder } from 'obsidian';
 
-import { assertNoCaseCollisions, planSync } from './sync/plan';
-import { applyPacketToDigests, createPendingUpload, digestBytes, encodePacket, MAX_PACKET_BYTES, readPendingUpload, validateSyncPath } from './sync/packet';
+import { applyInitialSnapshot } from './sync/apply';
+import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from './sync/plan';
+import { applyPacketToDigests, createPendingDownload, createPendingUpload, digestBytes, encodePacket, MAX_PACKET_BYTES, readPendingDownload, readPendingUpload, validateSyncPath } from './sync/packet';
 
 const MAX_PREVIEW_REVISIONS = 100;
 const MAX_PREVIEW_BYTES = 32 * 1024 * 1024;
@@ -39,17 +40,23 @@ function serverBaseUrl(serverUrl: string): string {
 export default class OwnSyncPlugin extends Plugin {
   settings: OwnSyncSettings = DEFAULT_SETTINGS;
   private pendingUpload: unknown = null;
+  private pendingDownload: unknown = null;
   private uploadRunning = false;
+  private downloadRunning = false;
   private saveChain: Promise<void> = Promise.resolve();
 
   async onload(): Promise<void> {
-    const saved = await this.loadData() as (Partial<OwnSyncSettings> & { pendingUpload?: unknown }) | null;
+    const saved = await this.loadData() as (Partial<OwnSyncSettings> & {
+      pendingUpload?: unknown;
+      pendingDownload?: unknown;
+    }) | null;
     this.settings = {
       serverUrl: typeof saved?.serverUrl === 'string' ? saved.serverUrl : '',
       vaultId: typeof saved?.vaultId === 'string' ? saved.vaultId : '',
       tokenSecretId: typeof saved?.tokenSecretId === 'string' ? saved.tokenSecretId : '',
     };
     this.pendingUpload = saved?.pendingUpload ?? null;
+    this.pendingDownload = saved?.pendingDownload ?? null;
 
     this.addSettingTab(new OwnSyncSettingTab(this.app, this));
     this.addCommand({
@@ -72,10 +79,15 @@ export default class OwnSyncPlugin extends Plugin {
       name: 'Upload test vault to empty server',
       callback: () => { void this.uploadTestVault(); },
     });
+    this.addCommand({
+      id: 'download-test-vault',
+      name: 'Download first test revision into empty vault',
+      callback: () => { void this.downloadTestVault(); },
+    });
   }
 
   async saveSettings(): Promise<void> {
-    const snapshot = { ...this.settings, pendingUpload: this.pendingUpload };
+    const snapshot = { ...this.settings, pendingUpload: this.pendingUpload, pendingDownload: this.pendingDownload };
     this.saveChain = this.saveChain.catch(() => {}).then(() => this.saveData(snapshot));
     await this.saveChain;
   }
@@ -235,6 +247,10 @@ export default class OwnSyncPlugin extends Plugin {
     }
     const vaultId = connection.vaultId.toLowerCase();
     const endpoint = `${connection.baseUrl}/api/v0/vaults/${vaultId}`;
+    if (this.pendingDownload !== null) {
+      new Notice('Own Sync: finish the pending test download before uploading.');
+      return;
+    }
     if (this.pendingUpload === null) {
       try {
         const head = await requestUrl({
@@ -309,6 +325,106 @@ export default class OwnSyncPlugin extends Plugin {
       }
     } catch {
       new Notice('Own Sync: upload result unknown. Pending operation kept for an identical retry.');
+    }
+  }
+
+  async downloadTestVault(): Promise<void> {
+    if (this.downloadRunning) return;
+    this.downloadRunning = true;
+    try {
+      await this.downloadTestVaultOnce();
+    } finally {
+      this.downloadRunning = false;
+    }
+  }
+
+  private async downloadTestVaultOnce(): Promise<void> {
+    let connection: { baseUrl: string; vaultId: string; token: string };
+    try {
+      connection = this.vaultConnection();
+    } catch (error) {
+      new Notice(`Own Sync: ${(error as Error).message}`);
+      return;
+    }
+    if (this.pendingUpload !== null) {
+      new Notice('Own Sync: finish the pending test upload before downloading.');
+      return;
+    }
+    const vaultId = connection.vaultId.toLowerCase();
+    const endpoint = `${connection.baseUrl}/api/v0/vaults/${vaultId}`;
+    if (this.pendingDownload === null) {
+      if (this.app.vault.getFiles().length !== 0) {
+        new Notice('Own Sync: first download needs an empty local test vault. No files changed.');
+        return;
+      }
+      try {
+        const headers = { Authorization: `Bearer ${connection.token}` };
+        const head = await requestUrl({ url: `${endpoint}/head`, method: 'GET', headers, throw: false });
+        if (head.status !== 200 || head.json?.current_revision !== 1) {
+          new Notice('Own Sync: first download needs exactly one server revision. No files changed.');
+          return;
+        }
+        const response = await requestUrl({
+          url: `${endpoint}/commits/1`, method: 'GET', headers, throw: false,
+        });
+        if (response.status !== 200) {
+          new Notice(`Own Sync: could not read first revision (HTTP ${response.status}).`);
+          return;
+        }
+        const pending = createPendingDownload(connection.baseUrl, vaultId, response.arrayBuffer);
+        const { changes } = await readPendingDownload(pending);
+        assertNoCaseCollisions(changes.map((change) => change.path));
+        assertNoFileDirectoryCollisions(changes.map((change) => change.path));
+        this.pendingDownload = pending;
+        try {
+          await this.saveSettings();
+        } catch {
+          this.pendingDownload = null;
+          throw new Error('Could not persist pending download.');
+        }
+      } catch {
+        new Notice('Own Sync: could not prepare or save first download. No files changed.');
+        return;
+      }
+    }
+
+    try {
+      const { pending, changes } = await readPendingDownload(this.pendingDownload);
+      if (pending.serverUrl !== connection.baseUrl || pending.vaultId !== vaultId) {
+        new Notice('Own Sync: pending download belongs to another server or vault. Restore its settings before retrying.');
+        return;
+      }
+      const paths = changes.map((change) => change.path);
+      assertNoCaseCollisions(paths);
+      assertNoFileDirectoryCollisions(paths);
+      const vault = this.app.vault;
+      await applyInitialSnapshot({
+        listPaths: () => vault.getFiles().map((file) => file.path),
+        read: async (path) => {
+          const file = vault.getAbstractFileByPath(path);
+          if (file === null) return null;
+          if (!(file instanceof TFile)) throw new Error('Folder conflicts with a downloaded file.');
+          return new Uint8Array(await vault.readBinary(file));
+        },
+        ensureFolder: async (path) => {
+          const existing = vault.getAbstractFileByPath(path);
+          if (existing === null) await vault.createFolder(path);
+          else if (!(existing instanceof TFolder)) throw new Error('File conflicts with a downloaded folder.');
+        },
+        create: async (path, bytes) => {
+          await vault.createBinary(path, new Uint8Array(bytes).buffer);
+        },
+      }, changes);
+      this.pendingDownload = null;
+      try {
+        await this.saveSettings();
+        new Notice(`Own Sync: downloaded ${changes.length} test files. Later revisions are not synced.`);
+      } catch {
+        this.pendingDownload = pending;
+        new Notice('Own Sync: files were created, but local confirmation failed. An identical retry is safe.');
+      }
+    } catch {
+      new Notice('Own Sync: download stopped. Pending packet kept; existing files were not overwritten.');
     }
   }
 }
@@ -388,6 +504,15 @@ class OwnSyncSettingTab extends PluginSettingTab {
         .setButtonText('Upload test vault')
         .onClick(async () => {
           await this.plugin.uploadTestVault();
+        }));
+
+    new Setting(containerEl)
+      .setName('First test download')
+      .setDesc('Create files from server revision 1 in an empty disposable vault. Never overwrites an existing file; a partial download can be retried.')
+      .addButton((button) => button
+        .setButtonText('Download test vault')
+        .onClick(async () => {
+          await this.plugin.downloadTestVault();
         }));
   }
 }
