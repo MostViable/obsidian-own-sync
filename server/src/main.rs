@@ -35,10 +35,41 @@ async fn main() -> Result<(), Box<dyn Error>> {
             );
             return Ok(());
         }
+        Some(command) if command == "provision" => {
+            let db_path = arguments.next().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "provision needs a database path")
+            })?;
+            let owner_credentials_path = arguments.next().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "provision needs owner credentials path")
+            })?;
+            let device_credentials_path = arguments.next().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "provision needs device credentials path")
+            })?;
+            if arguments.next().is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "provision accepts a database path, owner credentials path and device credentials path",
+                )
+                .into());
+            }
+            let db_path = PathBuf::from(db_path);
+            let owner_credentials_path = PathBuf::from(owner_credentials_path);
+            let device_credentials_path = PathBuf::from(device_credentials_path);
+            bootstrap::provision_device(
+                &db_path,
+                &owner_credentials_path,
+                &device_credentials_path,
+            )?;
+            println!(
+                "Device credentials written to {}",
+                device_credentials_path.display()
+            );
+            return Ok(());
+        }
         Some(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: own-sync-server [bootstrap <database-path> <credentials-path>]",
+                "usage: own-sync-server [bootstrap <database-path> <credentials-path> | provision <database-path> <owner-credentials-path> <device-credentials-path>]",
             )
             .into());
         }

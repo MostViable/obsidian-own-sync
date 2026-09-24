@@ -10,16 +10,20 @@ const MAX_PREVIEW_BYTES = 32 * 1024 * 1024;
 
 class PreviewLimitError extends Error {}
 
+type SyncStatus = 'setup' | 'syncing' | 'synced' | 'queued' | 'conflict' | 'error';
+
 interface OwnSyncSettings {
   serverUrl: string;
   vaultId: string;
   tokenSecretId: string;
+  automaticSync: boolean;
 }
 
 const DEFAULT_SETTINGS: OwnSyncSettings = {
   serverUrl: '',
   vaultId: '',
   tokenSecretId: '',
+  automaticSync: false,
 };
 
 function serverBaseUrl(serverUrl: string): string {
@@ -46,6 +50,9 @@ export default class OwnSyncPlugin extends Plugin {
   private confirmed: unknown = null;
   private mutationRunning = false;
   private saveChain: Promise<void> = Promise.resolve();
+  private autoSyncTimer: number | null = null;
+  private statusBarItem: HTMLElement | null = null;
+  syncStatus: SyncStatus = 'setup';
 
   async onload(): Promise<void> {
     const saved = await this.loadData() as (Partial<OwnSyncSettings> & {
@@ -58,11 +65,15 @@ export default class OwnSyncPlugin extends Plugin {
       serverUrl: typeof saved?.serverUrl === 'string' ? saved.serverUrl : '',
       vaultId: typeof saved?.vaultId === 'string' ? saved.vaultId : '',
       tokenSecretId: typeof saved?.tokenSecretId === 'string' ? saved.tokenSecretId : '',
+      automaticSync: saved?.automaticSync === true,
     };
     this.pendingUpload = saved?.pendingUpload ?? null;
     this.pendingDownload = saved?.pendingDownload ?? null;
     this.pendingPull = saved?.pendingPull ?? null;
     this.confirmed = saved?.confirmed ?? null;
+
+    this.statusBarItem = this.addStatusBarItem();
+    this.updateStatus('setup');
 
     this.addSettingTab(new OwnSyncSettingTab(this.app, this));
     this.addCommand({
@@ -110,6 +121,125 @@ export default class OwnSyncPlugin extends Plugin {
       name: 'Reconcile pending test upload',
       callback: () => { void this.reconcilePendingUpload(); },
     });
+    this.addCommand({
+      id: 'sync-now',
+      name: 'Sync test vault now',
+      callback: () => { void this.runAutoSync(); },
+    });
+
+    this.app.workspace.onLayoutReady(() => {
+      this.registerEvent(this.app.vault.on('create', () => this.scheduleAutoSync(), this));
+      this.registerEvent(this.app.vault.on('modify', () => this.scheduleAutoSync(), this));
+      this.registerEvent(this.app.vault.on('delete', () => this.scheduleAutoSync(), this));
+      this.registerEvent(this.app.vault.on('rename', () => this.scheduleAutoSync(), this));
+      this.registerDomEvent(document, 'visibilitychange', () => {
+        if (!document.hidden) this.scheduleAutoSync(0);
+      });
+      this.registerDomEvent(window, 'online', () => this.scheduleAutoSync(0));
+      this.scheduleAutoSync(0);
+    });
+  }
+
+  onunload(): void {
+    if (this.autoSyncTimer !== null) {
+      window.clearTimeout(this.autoSyncTimer);
+      this.autoSyncTimer = null;
+    }
+  }
+
+  private updateStatus(status: SyncStatus): void {
+    this.syncStatus = status;
+    if (this.statusBarItem === null) return;
+    this.statusBarItem.setText(this.statusText());
+    this.statusBarItem.setAttr('aria-label', this.statusText());
+  }
+
+  statusText(): string {
+    const labels: Record<SyncStatus, string> = {
+      setup: 'Own Sync: setup required',
+      syncing: 'Own Sync: syncing…',
+      synced: 'Own Sync: synced',
+      queued: 'Own Sync: changes queued',
+      conflict: 'Own Sync: conflict needs review',
+      error: 'Own Sync: sync error',
+    };
+    return labels[this.syncStatus];
+  }
+
+  async setAutomaticSync(enabled: boolean): Promise<void> {
+    const previous = this.settings.automaticSync;
+    this.settings.automaticSync = enabled;
+    try {
+      await this.saveSettings();
+    } catch {
+      this.settings.automaticSync = previous;
+      throw new Error('Could not save automatic sync setting.');
+    }
+    if (enabled) this.scheduleAutoSync(0);
+    else if (this.autoSyncTimer !== null) {
+      window.clearTimeout(this.autoSyncTimer);
+      this.autoSyncTimer = null;
+    }
+  }
+
+  async syncNow(): Promise<void> {
+    await this.runAutoSync();
+  }
+
+  private scheduleAutoSync(delay = 1500): void {
+    if (!this.settings.automaticSync || document.hidden) return;
+    if (this.autoSyncTimer !== null) window.clearTimeout(this.autoSyncTimer);
+    this.autoSyncTimer = window.setTimeout(() => {
+      this.autoSyncTimer = null;
+      void this.runAutoSync();
+    }, delay);
+  }
+
+  private async runAutoSync(): Promise<void> {
+    if (this.mutationRunning) {
+      this.scheduleAutoSync();
+      return;
+    }
+    this.mutationRunning = true;
+    this.updateStatus('syncing');
+    try {
+      await this.runAutoSyncOnce();
+    } catch {
+      this.updateStatus('error');
+      new Notice('Own Sync: sync stopped unexpectedly. Check the saved queue and retry.');
+    } finally {
+      this.mutationRunning = false;
+      if (this.settings.automaticSync && this.syncStatus === 'error') this.scheduleAutoSync(15000);
+    }
+  }
+
+  private async runAutoSyncOnce(): Promise<void> {
+    if (this.pendingDownload !== null || this.confirmed === null) {
+      this.updateStatus('setup');
+      return;
+    }
+    let connection: { baseUrl: string; vaultId: string; token: string };
+    try {
+      connection = this.vaultConnection();
+    } catch {
+      this.updateStatus('setup');
+      return;
+    }
+
+    if (this.pendingUpload !== null) {
+      await this.reconcilePendingUploadOnce();
+      if (this.pendingUpload !== null || this.pendingPull !== null || this.syncStatus === 'error' ||
+        this.syncStatus === 'conflict') return;
+    }
+    await this.pullRemoteChangesOnce();
+    if (this.syncStatus === 'setup' || this.syncStatus === 'error' || this.syncStatus === 'conflict') return;
+    if (this.pendingPull !== null || this.pendingUpload !== null) {
+      this.updateStatus('queued');
+      return;
+    }
+    await this.pushLocalChangesOnce();
+    if (this.pendingUpload !== null && this.syncStatus === 'syncing') this.updateStatus('queued');
+    else if (this.syncStatus === 'syncing') this.updateStatus('synced');
   }
 
   async saveSettings(): Promise<void> {
@@ -270,6 +400,7 @@ export default class OwnSyncPlugin extends Plugin {
         throw new Error('Confirmed state belongs to another server or vault.');
       }
     } catch {
+      this.updateStatus('setup');
       new Notice('Own Sync: no confirmed base for this vault. Complete the first test transfer.');
       return;
     }
@@ -401,6 +532,7 @@ export default class OwnSyncPlugin extends Plugin {
         }
         const packet = await encodePacket(changes);
         this.pendingUpload = createPendingUpload(connection.baseUrl, vaultId, packet);
+        this.updateStatus('queued');
         try {
           await this.saveSettings();
         } catch {
@@ -408,6 +540,7 @@ export default class OwnSyncPlugin extends Plugin {
           throw new Error('Could not persist pending upload.');
         }
       } catch {
+        this.updateStatus('error');
         new Notice('Own Sync: could not prepare or save test upload. No files sent.');
         return;
       }
@@ -479,6 +612,7 @@ export default class OwnSyncPlugin extends Plugin {
           throw new Error('Could not persist pending download.');
         }
       } catch {
+        this.updateStatus('error');
         new Notice('Own Sync: could not prepare or save first download. No files changed.');
         return;
       }
@@ -517,6 +651,7 @@ export default class OwnSyncPlugin extends Plugin {
       this.confirmed = nextConfirmed;
       try {
         await this.saveSettings();
+        this.updateStatus('synced');
         new Notice(`Own Sync: downloaded ${changes.length} test files. Later revisions are not synced.`);
       } catch {
         this.pendingDownload = pending;
@@ -524,6 +659,7 @@ export default class OwnSyncPlugin extends Plugin {
         new Notice('Own Sync: files were created, but local confirmation failed. An identical retry is safe.');
       }
     } catch {
+      this.updateStatus('error');
       new Notice('Own Sync: download stopped. Pending packet kept; existing files were not overwritten.');
     }
   }
@@ -543,6 +679,7 @@ export default class OwnSyncPlugin extends Plugin {
     try {
       connection = this.vaultConnection();
     } catch (error) {
+      this.updateStatus('error');
       new Notice(`Own Sync: ${(error as Error).message}`);
       return;
     }
@@ -551,6 +688,7 @@ export default class OwnSyncPlugin extends Plugin {
       return;
     }
     if (this.pendingPull !== null) {
+      this.updateStatus('queued');
       new Notice('Own Sync: finish the pending remote pull before pushing changes.');
       return;
     }
@@ -567,6 +705,7 @@ export default class OwnSyncPlugin extends Plugin {
         throw new Error('Confirmed state belongs to another server or vault.');
       }
     } catch {
+      this.updateStatus('error');
       new Notice('Own Sync: no valid confirmed base for this vault. Complete the first test transfer.');
       return;
     }
@@ -578,6 +717,7 @@ export default class OwnSyncPlugin extends Plugin {
         headers: { Authorization: `Bearer ${connection.token}` }, throw: false,
       });
       if (head.status !== 200 || head.json?.current_revision !== confirmed.state.revision) {
+        this.updateStatus(head.status === 200 ? 'conflict' : 'error');
         new Notice('Own Sync: server revision differs from the confirmed base. Local files were not sent.');
         return;
       }
@@ -587,12 +727,14 @@ export default class OwnSyncPlugin extends Plugin {
         validateSyncPath(file.path);
         scannedBytes += file.stat.size;
         if (scannedBytes > MAX_PREVIEW_BYTES) {
+          this.updateStatus('error');
           new Notice('Own Sync: local test vault exceeds the 32 MiB scan limit. No files sent.');
           return;
         }
         const bytes = new Uint8Array(await this.app.vault.readBinary(file));
         scannedBytes += bytes.byteLength - file.stat.size;
         if (scannedBytes > MAX_PREVIEW_BYTES) {
+          this.updateStatus('error');
           new Notice('Own Sync: local test vault exceeds the 32 MiB scan limit. No files sent.');
           return;
         }
@@ -609,6 +751,7 @@ export default class OwnSyncPlugin extends Plugin {
       this.pendingUpload = createPendingUpload(
         connection.baseUrl, confirmed.state.vaultId, packet, confirmed.state.revision,
       );
+      this.updateStatus('queued');
       try {
         await this.saveSettings();
       } catch {
@@ -616,6 +759,7 @@ export default class OwnSyncPlugin extends Plugin {
         throw new Error('Could not persist pending changes.');
       }
     } catch {
+      this.updateStatus('error');
       new Notice('Own Sync: could not prepare or save local changes. No new request sent.');
       return;
     }
@@ -631,11 +775,13 @@ export default class OwnSyncPlugin extends Plugin {
     try {
       ({ pending, body } = await readPendingUpload(this.pendingUpload));
       if (pending.serverUrl !== connection.baseUrl || pending.vaultId !== connection.vaultId.toLowerCase()) {
+        this.updateStatus('error');
         new Notice('Own Sync: pending upload belongs to another server or vault. Restore its settings before retrying.');
         return 'blocked';
       }
       nextConfirmed = await confirmedAfterUpload(this.confirmed, pending);
     } catch {
+      this.updateStatus('error');
       new Notice('Own Sync: pending upload or confirmed base is invalid. No request sent.');
       return 'blocked';
     }
@@ -662,24 +808,29 @@ export default class OwnSyncPlugin extends Plugin {
         try {
           await this.saveSettings();
           new Notice(`Own Sync: test changes confirmed at revision ${nextConfirmed.revision}.`);
+          this.updateStatus('synced');
           return 'confirmed';
         } catch {
           this.confirmed = previousConfirmed;
           this.pendingUpload = pending;
           new Notice('Own Sync: server accepted changes, but local confirmation failed. Retry is safe.');
+          this.updateStatus('error');
           return 'blocked';
         }
       } else if (result === 'conflict') {
         if (!quietConflict) {
           new Notice('Own Sync: server changed during upload. Pending operation kept; reconciliation is required.');
         }
+        this.updateStatus('conflict');
         return 'conflict';
       } else {
         new Notice(`Own Sync: server did not accept changes (HTTP ${response.status}). Pending operation kept.`);
+        this.updateStatus('error');
         return 'blocked';
       }
     } catch {
       new Notice('Own Sync: upload result unknown. Pending operation kept for an identical retry.');
+      this.updateStatus('error');
       return 'blocked';
     }
   }
@@ -776,6 +927,7 @@ export default class OwnSyncPlugin extends Plugin {
     if (this.pendingDownload !== null ||
       (rebaseOperationId === undefined && this.pendingUpload !== null) ||
       (rebaseOperationId !== undefined && this.pendingUpload === null)) {
+      this.updateStatus('queued');
       new Notice('Own Sync: finish the pending upload or first download before pulling changes.');
       return;
     }
@@ -787,10 +939,12 @@ export default class OwnSyncPlugin extends Plugin {
         const head = await requestUrl({ url: `${endpoint}/head`, method: 'GET', headers, throw: false });
         if (head.status !== 200 || !Number.isSafeInteger(head.json?.current_revision) ||
           head.json.current_revision < confirmed.state.revision) {
+          this.updateStatus('error');
           throw new Error('Invalid remote head.');
         }
         const revision: number = head.json.current_revision;
         if (revision === confirmed.state.revision) {
+          this.updateStatus('synced');
           new Notice(`Own Sync: already at confirmed revision ${revision}.`);
           return;
         }
@@ -835,6 +989,7 @@ export default class OwnSyncPlugin extends Plugin {
         assertNoFileDirectoryCollisions(remote.keys());
         const decisions = planFromConfirmed(confirmed.digests, local, remote);
         if (decisions.some((decision) => decision.action === 'conflict')) {
+          this.updateStatus('conflict');
           new Notice('Own Sync: local and remote files conflict. Pull stopped; preview changes first.');
           return;
         }
@@ -893,6 +1048,7 @@ export default class OwnSyncPlugin extends Plugin {
           throw new Error('Could not save pending remote changes.');
         }
       } catch (error) {
+        this.updateStatus('error');
         new Notice(error instanceof PreviewLimitError
           ? `Own Sync: ${error.message} No files changed.`
           : 'Own Sync: could not prepare the remote pull. No files changed.');
@@ -903,10 +1059,12 @@ export default class OwnSyncPlugin extends Plugin {
     try {
       const { pending, changes } = await readPendingPull(this.pendingPull);
       if (pending.serverUrl !== connection.baseUrl || pending.vaultId !== confirmed.state.vaultId) {
+        this.updateStatus('error');
         new Notice('Own Sync: pending pull belongs to another server or vault. Restore its settings before retrying.');
         return;
       }
       if (pending.rebaseOperationId !== rebaseOperationId) {
+        this.updateStatus('error');
         new Notice('Own Sync: pending pull belongs to a different operation. Use the matching retry command.');
         return;
       }
@@ -975,12 +1133,14 @@ export default class OwnSyncPlugin extends Plugin {
         new Notice('Own Sync: files changed, but confirmation could not be saved. Retry the pull.');
         return;
       }
+      if (this.pendingUpload === null) this.updateStatus('synced');
       new Notice(`Own Sync: pulled test changes through revision ${nextConfirmed.revision}.`);
       if (pending.rebaseOperationId !== undefined) {
         try { await this.pushLocalChangesOnce(); }
         catch { new Notice('Own Sync: rebase saved. Retry Push local changes to send remaining edits.'); }
       }
     } catch {
+      this.updateStatus('error');
       new Notice('Own Sync: remote pull stopped. Pending packet kept; retry after checking local files.');
     }
   }
@@ -1025,6 +1185,30 @@ class OwnSyncSettingTab extends PluginSettingTab {
         .onChange(async (value) => {
           this.plugin.settings.tokenSecretId = value;
           await this.plugin.saveSettings();
+        }));
+
+    new Setting(containerEl)
+      .setName('Automatic test sync')
+      .setDesc('After the first confirmed transfer, sync on vault changes, app return and network return. Transfers are unencrypted; use only disposable test vaults.')
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.automaticSync)
+        .onChange(async (value) => {
+          try {
+            await this.plugin.setAutomaticSync(value);
+          } catch (error) {
+            toggle.setValue(this.plugin.settings.automaticSync);
+            new Notice(`Own Sync: ${(error as Error).message}`);
+          }
+        }));
+
+    new Setting(containerEl)
+      .setName('Sync status')
+      .setDesc(this.plugin.statusText())
+      .addButton((button) => button
+        .setButtonText('Sync now')
+        .onClick(async () => {
+          await this.plugin.syncNow();
+          this.display();
         }));
 
     new Setting(containerEl)
