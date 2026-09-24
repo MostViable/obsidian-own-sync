@@ -535,7 +535,9 @@ impl SqliteStore {
             .prefix(".own-sync-backup-")
             .tempdir_in(parent)?;
         let temporary_path = temporary_dir.path().join("backup.sqlite");
-        let temporary_text = temporary_path.to_str().ok_or(StoreError::InvalidBackupPath)?;
+        let temporary_text = temporary_path
+            .to_str()
+            .ok_or(StoreError::InvalidBackupPath)?;
         self.connection
             .execute("VACUUM INTO ?1", params![temporary_text])?;
         #[cfg(unix)]
