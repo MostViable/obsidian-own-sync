@@ -47,7 +47,7 @@
 2. Установщик `install.sh` одной командой.
 3. Плагин: поле кода подключения вместо ручных настроек, автосинхронизация по умолчанию, журнал синхронизации.
 4. E2E-сценарии в CI с настоящим сервером, проверка в desktop Obsidian, затем alpha-релиз и проверка на VPS и телефоне.
-5. После MVP: протокол `v1` с шифрованием, историей и общими vault (issues #4, #6–#8), [issue #10](https://github.com/MostViable/obsidian-own-sync/issues/10) и вопрос по правилам Obsidian ([issue #9](https://github.com/MostViable/obsidian-own-sync/issues/9)).
+5. После MVP: протокол `v1` с шифрованием, историей, сжатием истории и общими vault (issues #4, #6–#8), [issue #10](https://github.com/MostViable/obsidian-own-sync/issues/10) и вопрос по правилам Obsidian ([issue #9](https://github.com/MostViable/obsidian-own-sync/issues/9)).
 
 ## Доступ GitHub
 
