@@ -1,21 +1,5 @@
-export const MAX_PACKET_BYTES = 1024 * 1024;
-
-export interface PendingUpload {
-  formatVersion: 1;
-  serverUrl: string;
-  vaultId: string;
-  operationId: string;
-  expectedRevision?: number;
-  packetText: string;
-}
-
-export interface PendingDownload {
-  formatVersion: 1;
-  serverUrl: string;
-  vaultId: string;
-  revision: 1;
-  packetText: string;
-}
+// Largest packet the plugin decodes; the upload limit comes from the server capabilities.
+export const MAX_DECODED_PACKET_BYTES = 64 * 1024 * 1024;
 
 export function classifyUploadResponse(
   status: number, value: unknown, expectedRevision: number,
@@ -98,7 +82,7 @@ function decodeBase64(value: string): Uint8Array {
   return bytes;
 }
 
-export async function encodePacket(changes: readonly FileChange[]): Promise<Uint8Array> {
+export async function encodePacket(changes: readonly FileChange[], maxBytes: number): Promise<Uint8Array> {
   if (changes.length === 0) {
     throw new Error('A packet needs at least one change.');
   }
@@ -116,14 +100,14 @@ export async function encodePacket(changes: readonly FileChange[]): Promise<Uint
   }
   const packet: EncodedPacket = { format_version: 1, changes: encoded };
   const bytes = textEncoder.encode(JSON.stringify(packet));
-  if (bytes.byteLength > MAX_PACKET_BYTES) {
+  if (bytes.byteLength > maxBytes) {
     throw new Error('Packet exceeds the server limit.');
   }
   return bytes;
 }
 
 export async function decodePacket(bytes: ArrayBuffer): Promise<FileChange[]> {
-  if (bytes.byteLength === 0 || bytes.byteLength > MAX_PACKET_BYTES) {
+  if (bytes.byteLength === 0 || bytes.byteLength > MAX_DECODED_PACKET_BYTES) {
     throw new Error('Invalid packet size.');
   }
   const packet: unknown = JSON.parse(textDecoder.decode(bytes));
@@ -182,70 +166,4 @@ export async function applyPacketToDigests(state: Map<string, string>, packet: A
     if (update.digest === undefined) state.delete(update.path);
     else state.set(update.path, update.digest);
   }
-}
-
-export function createPendingUpload(
-  serverUrl: string, vaultId: string, packet: Uint8Array, expectedRevision = 0,
-): PendingUpload {
-  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || expectedRevision === Number.MAX_SAFE_INTEGER) {
-    throw new Error('Invalid expected revision.');
-  }
-  const id = new Uint8Array(16);
-  crypto.getRandomValues(id);
-  return {
-    formatVersion: 1,
-    serverUrl,
-    vaultId,
-    operationId: [...id].map((part) => part.toString(16).padStart(2, '0')).join(''),
-    expectedRevision,
-    packetText: textDecoder.decode(packet),
-  };
-}
-
-export async function readPendingUpload(value: unknown): Promise<{ pending: PendingUpload; body: ArrayBuffer }> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('Invalid pending upload.');
-  }
-  const candidate = value as Record<string, unknown>;
-  const expectedRevision = candidate.expectedRevision === undefined ? 0 : candidate.expectedRevision;
-  if (candidate.formatVersion !== 1 || typeof candidate.serverUrl !== 'string' ||
-    typeof candidate.vaultId !== 'string' || !/^[0-9a-f]{32}$/i.test(candidate.vaultId) ||
-    typeof candidate.operationId !== 'string' || !/^[0-9a-f]{32}$/i.test(candidate.operationId) ||
-    typeof candidate.packetText !== 'string' ||
-    typeof expectedRevision !== 'number' || !Number.isSafeInteger(expectedRevision) ||
-    expectedRevision < 0 || expectedRevision === Number.MAX_SAFE_INTEGER ||
-    Object.keys(candidate).length !== (candidate.expectedRevision === undefined ? 5 : 6)) {
-    throw new Error('Invalid pending upload.');
-  }
-  const body = textEncoder.encode(candidate.packetText).buffer;
-  await decodePacket(body);
-  return { pending: candidate as unknown as PendingUpload, body };
-}
-
-export function createPendingDownload(serverUrl: string, vaultId: string, packet: ArrayBuffer): PendingDownload {
-  return {
-    formatVersion: 1,
-    serverUrl,
-    vaultId,
-    revision: 1,
-    packetText: textDecoder.decode(packet),
-  };
-}
-
-export async function readPendingDownload(value: unknown): Promise<{ pending: PendingDownload; changes: FileChange[] }> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('Invalid pending download.');
-  }
-  const candidate = value as Record<string, unknown>;
-  if (candidate.formatVersion !== 1 || typeof candidate.serverUrl !== 'string' ||
-    typeof candidate.vaultId !== 'string' || !/^[0-9a-f]{32}$/i.test(candidate.vaultId) ||
-    candidate.revision !== 1 || typeof candidate.packetText !== 'string' ||
-    Object.keys(candidate).length !== 5) {
-    throw new Error('Invalid pending download.');
-  }
-  const changes = await decodePacket(textEncoder.encode(candidate.packetText).buffer);
-  if (changes.some((change) => change.kind !== 'put')) {
-    throw new Error('Initial download cannot contain deletions.');
-  }
-  return { pending: candidate as unknown as PendingDownload, changes };
 }

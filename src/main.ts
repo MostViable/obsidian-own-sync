@@ -1,24 +1,27 @@
-import { App, Notice, Plugin, PluginSettingTab, requestUrl, SecretComponent, Setting, TFile, TFolder } from 'obsidian';
+import { App, Notice, Plugin, PluginSettingTab, requestUrl, SecretComponent, Setting, TFile, TFolder, type RequestUrlParam, type RequestUrlResponse } from 'obsidian';
 
-import { applyInitialSnapshot, applyRemoteChanges } from './sync/apply';
-import { assertCompatibleCapabilities } from './sync/capabilities';
-import { isSyncableVaultPath } from './sync/files';
-import { assertNoCaseCollisions, assertNoFileDirectoryCollisions, planSync } from './sync/plan';
-import { applyPacketToDigests, classifyUploadResponse, createPendingDownload, createPendingUpload, decodePacket, digestBytes, encodePacket, MAX_PACKET_BYTES, readPendingDownload, readPendingUpload, validateSyncPath, type FileChange } from './sync/packet';
-import { advanceConfirmedRevision, assertRebaseLocalFiles, changesFromLocal, confirmedAfterInitialDownload, confirmedAfterPull, confirmedAfterUpload, createPendingPull, planFromConfirmed, queuedUploadDigests, readConfirmedState, readPendingPull } from './sync/state';
+import { packetLimitFromCapabilities } from './sync/capabilities';
+import { SyncEngine, SyncError, type ServerPort, type StoragePort, type SyncReport, type VaultFile, type VaultPort } from './sync/engine';
 
-const MAX_PREVIEW_REVISIONS = 100;
-const MAX_PREVIEW_BYTES = 32 * 1024 * 1024;
+const AUTO_SYNC_DELAY = 1500;
+const POLL_INTERVAL = 30000;
+const BUSY_RETRY_DELAY = 3000;
+const OFFLINE_RETRY_DELAY = 15000;
+const ERROR_RETRY_DELAY = 60000;
 
-class PreviewLimitError extends Error {}
-
-type SyncStatus = 'setup' | 'syncing' | 'synced' | 'queued' | 'conflict' | 'error';
+type SyncStatus = 'setup' | 'syncing' | 'synced' | 'offline' | 'error';
 
 interface OwnSyncSettings {
   serverUrl: string;
   vaultId: string;
   tokenSecretId: string;
   automaticSync: boolean;
+}
+
+interface Connection {
+  baseUrl: string;
+  vaultId: string;
+  token: string;
 }
 
 const DEFAULT_SETTINGS: OwnSyncSettings = {
@@ -44,89 +47,98 @@ function serverBaseUrl(serverUrl: string): string {
   return `${url.origin}${path}`;
 }
 
+function responseJson(response: RequestUrlResponse): unknown {
+  try {
+    return response.json;
+  } catch {
+    return null;
+  }
+}
+
+function serverPort(connection: Connection): ServerPort {
+  const endpoint = `${connection.baseUrl}/api/v0/vaults/${connection.vaultId}`;
+  const authorization = { Authorization: `Bearer ${connection.token}` };
+  const send = async (request: RequestUrlParam): Promise<RequestUrlResponse> => {
+    try {
+      return await requestUrl({ ...request, throw: false });
+    } catch {
+      throw new SyncError('offline', 'Could not reach the server.');
+    }
+  };
+  const failure = (status: number): SyncError => {
+    if (status === 401 || status === 403) return new SyncError('unauthorized', 'This device has no access to the vault.');
+    if (status === 404) return new SyncError('server', 'The server does not know this vault or its sync API is disabled.');
+    return new SyncError('server', `The server returned HTTP ${status}.`);
+  };
+  return {
+    capabilities: async () => {
+      const response = await send({ url: `${connection.baseUrl}/api/v0/capabilities`, method: 'GET' });
+      if (response.status !== 200) throw failure(response.status);
+      return responseJson(response);
+    },
+    head: async () => {
+      const response = await send({ url: `${endpoint}/head`, method: 'GET', headers: authorization });
+      if (response.status !== 200) throw failure(response.status);
+      const value = responseJson(response) as { current_revision?: unknown } | null;
+      return typeof value?.current_revision === 'number' ? value.current_revision : -1;
+    },
+    commit: async (revision) => {
+      const response = await send({ url: `${endpoint}/commits/${revision}`, method: 'GET', headers: authorization });
+      if (response.status !== 200) throw failure(response.status);
+      return response.arrayBuffer;
+    },
+    upload: async (operationId, expectedRevision, body) => {
+      const response = await send({
+        url: `${endpoint}/operations/${operationId}`,
+        method: 'POST',
+        contentType: 'application/octet-stream',
+        headers: { ...authorization, 'X-Expected-Revision': String(expectedRevision) },
+        body: body.slice().buffer,
+      });
+      return { status: response.status, json: responseJson(response) };
+    },
+  };
+}
+
 export default class OwnSyncPlugin extends Plugin {
   settings: OwnSyncSettings = DEFAULT_SETTINGS;
-  private pendingUpload: unknown = null;
-  private pendingDownload: unknown = null;
-  private pendingPull: unknown = null;
-  private confirmed: unknown = null;
-  private mutationRunning = false;
-  private saveChain: Promise<void> = Promise.resolve();
+  syncStatus: SyncStatus = 'setup';
+  private statusDetail = '';
+  private engine: SyncEngine | null = null;
+  private engineKey = '';
+  private syncRunning = false;
+  private syncRequested = false;
+  private lastErrorMessage = '';
   private autoSyncTimer: number | null = null;
   private statusBarItem: HTMLElement | null = null;
-  syncStatus: SyncStatus = 'setup';
 
   async onload(): Promise<void> {
-    const saved = await this.loadData() as (Partial<OwnSyncSettings> & {
-      pendingUpload?: unknown;
-      pendingDownload?: unknown;
-      pendingPull?: unknown;
-      confirmed?: unknown;
-    }) | null;
+    const saved = await this.loadData() as Partial<OwnSyncSettings> | null;
     this.settings = {
       serverUrl: typeof saved?.serverUrl === 'string' ? saved.serverUrl : '',
       vaultId: typeof saved?.vaultId === 'string' ? saved.vaultId : '',
       tokenSecretId: typeof saved?.tokenSecretId === 'string' ? saved.tokenSecretId : '',
       automaticSync: saved?.automaticSync === true,
     };
-    this.pendingUpload = saved?.pendingUpload ?? null;
-    this.pendingDownload = saved?.pendingDownload ?? null;
-    this.pendingPull = saved?.pendingPull ?? null;
-    this.confirmed = saved?.confirmed ?? null;
 
     this.statusBarItem = this.addStatusBarItem();
     this.updateStatus('setup');
 
     this.addSettingTab(new OwnSyncSettingTab(this.app, this));
     this.addCommand({
+      id: 'sync-now',
+      name: 'Sync now',
+      callback: () => void this.syncNow(),
+    });
+    this.addCommand({
       id: 'check-server-connection',
       name: 'Check server connection',
-      callback: () => { void this.checkServerConnection(); },
+      callback: () => void this.checkServerConnection(),
     });
     this.addCommand({
       id: 'check-vault-access',
       name: 'Check vault access',
-      callback: () => { void this.checkVaultAccess(); },
-    });
-    this.addCommand({
-      id: 'preview-first-sync',
-      name: 'Preview first sync',
-      callback: () => { void this.previewFirstSync(); },
-    });
-    this.addCommand({
-      id: 'preview-confirmed-changes',
-      name: 'Preview changes since confirmed revision',
-      callback: () => { void this.previewConfirmedChanges(); },
-    });
-    this.addCommand({
-      id: 'upload-test-vault',
-      name: 'Upload test vault to empty server',
-      callback: () => { void this.uploadTestVault(); },
-    });
-    this.addCommand({
-      id: 'download-test-vault',
-      name: 'Download first test revision into empty vault',
-      callback: () => { void this.downloadTestVault(); },
-    });
-    this.addCommand({
-      id: 'push-local-changes',
-      name: 'Push local test changes',
-      callback: () => { void this.pushLocalChanges(); },
-    });
-    this.addCommand({
-      id: 'pull-remote-changes',
-      name: 'Pull remote test changes',
-      callback: () => { void this.pullRemoteChanges(); },
-    });
-    this.addCommand({
-      id: 'reconcile-pending-upload',
-      name: 'Reconcile pending test upload',
-      callback: () => { void this.reconcilePendingUpload(); },
-    });
-    this.addCommand({
-      id: 'sync-now',
-      name: 'Sync test vault now',
-      callback: () => { void this.runAutoSync(); },
+      callback: () => void this.checkVaultAccess(),
     });
 
     this.app.workspace.onLayoutReady(() => {
@@ -138,7 +150,7 @@ export default class OwnSyncPlugin extends Plugin {
         if (!document.hidden) this.scheduleAutoSync(0);
       });
       this.registerDomEvent(window, 'online', () => this.scheduleAutoSync(0));
-      this.registerInterval(window.setInterval(() => this.scheduleAutoSync(0), 30000));
+      this.registerInterval(window.setInterval(() => this.scheduleAutoSync(0), POLL_INTERVAL));
       this.scheduleAutoSync(0);
     });
   }
@@ -150,8 +162,9 @@ export default class OwnSyncPlugin extends Plugin {
     }
   }
 
-  private updateStatus(status: SyncStatus): void {
+  private updateStatus(status: SyncStatus, detail = ''): void {
     this.syncStatus = status;
+    this.statusDetail = detail;
     if (this.statusBarItem === null) return;
     this.statusBarItem.setText(this.statusText());
     this.statusBarItem.setAttr('aria-label', this.statusText());
@@ -162,11 +175,10 @@ export default class OwnSyncPlugin extends Plugin {
       setup: 'Own Sync: setup required',
       syncing: 'Own Sync: syncing…',
       synced: 'Own Sync: synced',
-      queued: 'Own Sync: changes queued',
-      conflict: 'Own Sync: conflict needs review',
+      offline: 'Own Sync: offline, changes kept',
       error: 'Own Sync: sync error',
     };
-    return labels[this.syncStatus];
+    return this.statusDetail ? `${labels[this.syncStatus]} · ${this.statusDetail}` : labels[this.syncStatus];
   }
 
   async setAutomaticSync(enabled: boolean): Promise<void> {
@@ -186,78 +198,168 @@ export default class OwnSyncPlugin extends Plugin {
   }
 
   async syncNow(): Promise<void> {
-    await this.runAutoSync();
+    await this.runSync(true);
   }
 
-  private scheduleAutoSync(delay = 1500): void {
+  private scheduleAutoSync(delay = AUTO_SYNC_DELAY): void {
     if (!this.settings.automaticSync || document.hidden) return;
     if (this.autoSyncTimer !== null) window.clearTimeout(this.autoSyncTimer);
     this.autoSyncTimer = window.setTimeout(() => {
       this.autoSyncTimer = null;
-      void this.runAutoSync();
+      void this.runSync(false);
     }, delay);
   }
 
-  private async runAutoSync(): Promise<void> {
-    if (this.mutationRunning) {
-      this.scheduleAutoSync();
+  private syncEngine(): SyncEngine {
+    const connection = this.vaultConnection();
+    const key = `${connection.baseUrl}\n${connection.vaultId}\n${connection.token}`;
+    if (this.engine === null || this.engineKey !== key) {
+      this.engine = new SyncEngine({
+        serverUrl: connection.baseUrl,
+        vaultId: connection.vaultId,
+        vault: this.vaultPort(),
+        server: serverPort(connection),
+        storage: this.storagePort(),
+      });
+      this.engineKey = key;
+    }
+    return this.engine;
+  }
+
+  private async runSync(manual: boolean): Promise<void> {
+    if (this.syncRunning) {
+      this.syncRequested = true;
       return;
     }
-    this.mutationRunning = true;
-    this.updateStatus('syncing');
+    let engine: SyncEngine;
     try {
-      await this.runAutoSyncOnce();
-    } catch {
-      this.updateStatus('error');
-      new Notice('Own Sync: sync stopped unexpectedly. Check the saved queue and retry.');
+      engine = this.syncEngine();
+    } catch (error) {
+      this.updateStatus('setup');
+      if (manual) new Notice(`Own Sync: ${(error as Error).message}`);
+      return;
+    }
+    this.syncRunning = true;
+    this.updateStatus('syncing');
+    let retryDelay: number | null = null;
+    try {
+      this.showReport(await engine.sync(manual), manual);
+    } catch (error) {
+      retryDelay = this.showError(error, manual);
     } finally {
-      this.mutationRunning = false;
-      if (this.settings.automaticSync && this.syncStatus === 'error') this.scheduleAutoSync(15000);
+      this.syncRunning = false;
+    }
+    if (this.syncRequested) {
+      this.syncRequested = false;
+      this.scheduleAutoSync();
+    } else if (retryDelay !== null) {
+      this.scheduleAutoSync(retryDelay);
     }
   }
 
-  private async runAutoSyncOnce(): Promise<void> {
-    if (this.pendingDownload !== null || this.confirmed === null) {
-      this.updateStatus('setup');
-      return;
+  private showReport(report: SyncReport, manual: boolean): void {
+    this.lastErrorMessage = '';
+    const skipped: string[] = [];
+    if (report.oversized.length > 0) skipped.push(`${report.oversized.length} too large`);
+    if (report.invalidPaths.length > 0) skipped.push(`${report.invalidPaths.length} unsupported names`);
+    this.updateStatus('synced', skipped.length > 0 ? `not synced: ${skipped.join(', ')}` : '');
+    if (report.serverReset) {
+      new Notice('Own Sync: the server was restored from an older backup. Files were merged again; nothing was deleted.', 15000);
     }
-    let connection: { baseUrl: string; vaultId: string; token: string };
-    try {
-      connection = this.vaultConnection();
-    } catch {
-      this.updateStatus('setup');
-      return;
+    if (report.conflictCopies.length > 0) {
+      const shown = report.conflictCopies.slice(0, 3).join(', ');
+      const more = report.conflictCopies.length > 3 ? ` and ${report.conflictCopies.length - 3} more` : '';
+      new Notice(`Own Sync: files were edited on two devices. Both versions kept: ${shown}${more}.`, 15000);
     }
-    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
+    if (manual) {
+      const lists = [
+        report.oversized.length > 0 ? `Too large for the server: ${report.oversized.slice(0, 5).join(', ')}.` : '',
+        report.invalidPaths.length > 0 ? `Unsupported names: ${report.invalidPaths.slice(0, 5).join(', ')}.` : '',
+      ].filter(Boolean).join(' ');
+      new Notice(`Own Sync: synced at revision ${report.revision}.${lists ? ` ${lists}` : ''}`);
+    }
+  }
 
-    if (this.pendingUpload !== null) {
-      await this.reconcilePendingUploadOnce();
-      if (this.pendingUpload !== null || this.pendingPull !== null || this.syncStatus === 'error' ||
-        this.syncStatus === 'conflict') return;
+  // Shows an error once per distinct message and returns the automatic retry delay.
+  private showError(error: unknown, manual: boolean): number {
+    const syncError = error instanceof SyncError
+      ? error
+      : new SyncError('local', 'Sync stopped unexpectedly. Local files are unchanged and will be checked again.');
+    if (syncError.kind === 'busy') {
+      this.updateStatus('syncing');
+      return BUSY_RETRY_DELAY;
     }
-    await this.pullRemoteChangesOnce();
-    if (this.syncStatus !== 'synced') return;
-    if (this.pendingPull !== null || this.pendingUpload !== null) {
-      this.updateStatus('queued');
-      return;
+    if (syncError.kind === 'offline') {
+      this.updateStatus('offline');
+      if (manual) new Notice('Own Sync: the server is unreachable. Changes stay on this device until it is back.');
+      return OFFLINE_RETRY_DELAY;
     }
-    this.updateStatus('syncing');
-    await this.pushLocalChangesOnce();
-    const status = this.syncStatus as SyncStatus;
-    if (this.pendingUpload !== null && status === 'syncing') this.updateStatus('queued');
-    else if (status === 'syncing') this.updateStatus('synced');
+    this.updateStatus('error', syncError.message);
+    if (manual || syncError.message !== this.lastErrorMessage) new Notice(`Own Sync: ${syncError.message}`);
+    this.lastErrorMessage = syncError.message;
+    return ERROR_RETRY_DELAY;
+  }
+
+  private vaultPort(): VaultPort {
+    const vault = this.app.vault;
+    const info = (file: TFile): VaultFile => ({ path: file.path, mtime: file.stat.mtime, size: file.stat.size });
+    const ensureFolders = async (path: string): Promise<void> => {
+      const segments = path.split('/');
+      for (let index = 1; index < segments.length; index += 1) {
+        const folder = segments.slice(0, index).join('/');
+        const existing = vault.getAbstractFileByPath(folder);
+        if (existing === null) await vault.createFolder(folder);
+        else if (!(existing instanceof TFolder)) throw new SyncError('local', `A file blocks the folder ${folder}.`);
+      }
+    };
+    return {
+      list: () => vault.getFiles().map(info),
+      stat: (path) => {
+        const file = vault.getAbstractFileByPath(path);
+        return file instanceof TFile ? info(file) : null;
+      },
+      read: async (path) => {
+        const file = vault.getAbstractFileByPath(path);
+        return file instanceof TFile ? new Uint8Array(await vault.readBinary(file)) : null;
+      },
+      write: async (path, bytes) => {
+        const data = bytes.slice().buffer;
+        const existing = vault.getAbstractFileByPath(path);
+        if (existing instanceof TFile) {
+          await vault.modifyBinary(existing, data);
+        } else if (existing === null) {
+          await ensureFolders(path);
+          await vault.createBinary(path, data);
+        } else {
+          throw new SyncError('local', `A folder blocks the file ${path}.`);
+        }
+      },
+      trash: async (path) => {
+        const existing = vault.getAbstractFileByPath(path);
+        if (existing instanceof TFile) await this.app.fileManager.trashFile(existing);
+      },
+    };
+  }
+
+  private storagePort(): StoragePort {
+    const adapter = this.app.vault.adapter;
+    const directory = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+    const location = (name: string) => `${directory}/${name}`;
+    return {
+      read: async (name) => await adapter.exists(location(name))
+        ? new Uint8Array(await adapter.readBinary(location(name)))
+        : null,
+      write: async (name, bytes) => {
+        await adapter.writeBinary(location(name), bytes.slice().buffer);
+      },
+      remove: async (name) => {
+        if (await adapter.exists(location(name))) await adapter.remove(location(name));
+      },
+    };
   }
 
   async saveSettings(): Promise<void> {
-    const snapshot = {
-      ...this.settings,
-      pendingUpload: this.pendingUpload,
-      pendingDownload: this.pendingDownload,
-      pendingPull: this.pendingPull,
-      confirmed: this.confirmed,
-    };
-    this.saveChain = this.saveChain.catch(() => {}).then(() => this.saveData(snapshot));
-    await this.saveChain;
+    await this.saveData(this.settings);
   }
 
   async checkServerConnection(): Promise<void> {
@@ -287,41 +389,27 @@ export default class OwnSyncPlugin extends Plugin {
   }
 
   async checkVaultAccess(): Promise<void> {
-    let connection: { baseUrl: string; vaultId: string; token: string };
+    let connection: Connection;
     try {
       connection = this.vaultConnection();
     } catch (error) {
-      this.updateStatus('error');
       new Notice(`Own Sync: ${(error as Error).message}`);
       return;
     }
-    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
-
+    const server = serverPort(connection);
     try {
-      const response = await requestUrl({
-        url: `${connection.baseUrl}/api/v0/vaults/${connection.vaultId}/head`,
-        method: 'GET',
-        headers: { Authorization: `Bearer ${connection.token}` },
-        throw: false,
-      });
-      if (response.status === 401) {
-        new Notice('Own Sync: this device token has no access to the vault.');
-      } else if (response.status === 200 &&
-        Number.isSafeInteger(response.json?.current_revision) &&
-        response.json.current_revision >= 0) {
-        new Notice(`Own Sync: vault is accessible at revision ${response.json.current_revision}.`);
-      } else {
-        new Notice(`Own Sync: unexpected vault response (HTTP ${response.status}).`);
-      }
-    } catch {
-      new Notice('Own Sync: could not check vault access.');
+      packetLimitFromCapabilities(await server.capabilities());
+      const revision = await server.head();
+      new Notice(`Own Sync: vault is accessible at revision ${revision}.`);
+    } catch (error) {
+      new Notice(`Own Sync: ${(error as Error).message}`);
     }
   }
 
-  private vaultConnection(): { baseUrl: string; vaultId: string; token: string } {
+  private vaultConnection(): Connection {
     const baseUrl = serverBaseUrl(this.settings.serverUrl);
-    const vaultId = this.settings.vaultId.trim();
-    if (!/^[0-9a-f]{32}$/i.test(vaultId)) {
+    const vaultId = this.settings.vaultId.trim().toLowerCase();
+    if (!/^[0-9a-f]{32}$/.test(vaultId)) {
       throw new Error('Enter a 32-character hexadecimal vault ID.');
     }
     if (!this.settings.tokenSecretId) {
@@ -333,863 +421,14 @@ export default class OwnSyncPlugin extends Plugin {
     }
     return { baseUrl, vaultId, token };
   }
-
-  private async requireServerCapabilities(baseUrl: string): Promise<boolean> {
-    try {
-      const response = await requestUrl({
-        url: `${baseUrl}/api/v0/capabilities`, method: 'GET', throw: false,
-      });
-      if (response.status !== 200) throw new Error('Server did not report protocol capabilities.');
-      assertCompatibleCapabilities(response.json);
-      return true;
-    } catch (error) {
-      this.updateStatus('error');
-      new Notice(`Own Sync: ${(error as Error).message}`);
-      return false;
-    }
-  }
-
-  async previewFirstSync(): Promise<void> {
-    let connection: { baseUrl: string; vaultId: string; token: string };
-    try {
-      connection = this.vaultConnection();
-    } catch (error) {
-      this.updateStatus('error');
-      new Notice(`Own Sync: ${(error as Error).message}`);
-      return;
-    }
-    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
-
-    const endpoint = `${connection.baseUrl}/api/v0/vaults/${connection.vaultId}`;
-    const headers = { Authorization: `Bearer ${connection.token}` };
-    try {
-      const head = await requestUrl({ url: `${endpoint}/head`, method: 'GET', headers, throw: false });
-      if (head.status !== 200 || !Number.isSafeInteger(head.json?.current_revision) ||
-        head.json.current_revision < 0) {
-        new Notice(`Own Sync: could not read vault head (HTTP ${head.status}).`);
-        return;
-      }
-      const revision: number = head.json.current_revision;
-      if (revision > MAX_PREVIEW_REVISIONS) {
-        new Notice('Own Sync: test preview supports at most 100 revisions. No files changed.');
-        return;
-      }
-
-      const remote = new Map<string, string>();
-      let transferredBytes = 0;
-      for (let current = 1; current <= revision; current += 1) {
-        const response = await requestUrl({
-          url: `${endpoint}/commits/${current}`, method: 'GET', headers, throw: false,
-        });
-        if (response.status !== 200) {
-          throw new Error('Could not read a remote commit.');
-        }
-        transferredBytes += response.arrayBuffer.byteLength;
-        if (transferredBytes > MAX_PREVIEW_BYTES) {
-          throw new PreviewLimitError('Remote history exceeds the 32 MiB test preview limit.');
-        }
-        await applyPacketToDigests(remote, response.arrayBuffer);
-      }
-
-      const local = new Map<string, string>();
-      let scannedBytes = 0;
-      for (const file of this.app.vault.getFiles().filter((file) => isSyncableVaultPath(file.path))) {
-        validateSyncPath(file.path);
-        scannedBytes += file.stat.size;
-        if (scannedBytes > MAX_PREVIEW_BYTES) {
-          throw new PreviewLimitError('Local vault exceeds the 32 MiB test preview limit.');
-        }
-        local.set(file.path, await digestBytes(new Uint8Array(await this.app.vault.readBinary(file))));
-      }
-      assertNoCaseCollisions(new Set([...local.keys(), ...remote.keys()]));
-      const decisions = planSync(new Map(), local, remote);
-      const uploads = decisions.filter((decision) => decision.action === 'push').length;
-      const downloads = decisions.filter((decision) => decision.action === 'pull').length;
-      const conflicts = decisions.filter((decision) => decision.action === 'conflict').length;
-      new Notice(`Own Sync preview: ${uploads} uploads, ${downloads} downloads, ${conflicts} conflicts. No files changed.`, 15000);
-    } catch (error) {
-      new Notice(error instanceof PreviewLimitError
-        ? `Own Sync: ${error.message} No files changed.`
-        : 'Own Sync: preview failed or contains unsupported data. No files changed.');
-    }
-  }
-
-  async previewConfirmedChanges(): Promise<void> {
-    let connection: { baseUrl: string; vaultId: string; token: string };
-    let confirmed: ReturnType<typeof readConfirmedState>;
-    try {
-      connection = this.vaultConnection();
-      confirmed = readConfirmedState(this.confirmed);
-      if (confirmed.state.serverUrl !== connection.baseUrl ||
-        confirmed.state.vaultId !== connection.vaultId.toLowerCase()) {
-        throw new Error('Confirmed state belongs to another server or vault.');
-      }
-    } catch {
-      this.updateStatus('setup');
-      new Notice('Own Sync: no confirmed base for this vault. Complete the first test transfer.');
-      return;
-    }
-    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
-
-    const endpoint = `${connection.baseUrl}/api/v0/vaults/${confirmed.state.vaultId}`;
-    const headers = { Authorization: `Bearer ${connection.token}` };
-    try {
-      const head = await requestUrl({ url: `${endpoint}/head`, method: 'GET', headers, throw: false });
-      if (head.status !== 200 || !Number.isSafeInteger(head.json?.current_revision) ||
-        head.json.current_revision < 0) {
-        throw new Error('Could not read the remote head.');
-      }
-      const revision: number = head.json.current_revision;
-      if (revision < confirmed.state.revision) {
-        new Notice('Own Sync: server is behind the confirmed revision. No files changed.');
-        return;
-      }
-      if (revision - confirmed.state.revision > MAX_PREVIEW_REVISIONS) {
-        throw new PreviewLimitError('More than 100 remote revisions since the confirmed base.');
-      }
-
-      const remote = new Map(confirmed.digests);
-      let transferredBytes = 0;
-      for (let current = confirmed.state.revision + 1; current <= revision; current += 1) {
-        const response = await requestUrl({
-          url: `${endpoint}/commits/${current}`, method: 'GET', headers, throw: false,
-        });
-        if (response.status !== 200) throw new Error('Could not read a remote commit.');
-        transferredBytes += response.arrayBuffer.byteLength;
-        if (transferredBytes > MAX_PREVIEW_BYTES) {
-          throw new PreviewLimitError('Remote delta exceeds the 32 MiB test preview limit.');
-        }
-        await applyPacketToDigests(remote, response.arrayBuffer);
-      }
-
-      const local = new Map<string, string>();
-      let scannedBytes = 0;
-      for (const file of this.app.vault.getFiles().filter((file) => isSyncableVaultPath(file.path))) {
-        validateSyncPath(file.path);
-        scannedBytes += file.stat.size;
-        if (scannedBytes > MAX_PREVIEW_BYTES) {
-          throw new PreviewLimitError('Local vault exceeds the 32 MiB test preview limit.');
-        }
-        const bytes = new Uint8Array(await this.app.vault.readBinary(file));
-        scannedBytes += bytes.byteLength - file.stat.size;
-        if (scannedBytes > MAX_PREVIEW_BYTES) {
-          throw new PreviewLimitError('Local vault exceeds the 32 MiB test preview limit.');
-        }
-        local.set(file.path, await digestBytes(bytes));
-      }
-
-      const decisions = planFromConfirmed(confirmed.digests, local, remote);
-      const uploads = decisions.filter((decision) => decision.action === 'push').length;
-      const downloads = decisions.filter((decision) => decision.action === 'pull').length;
-      const conflicts = decisions.filter((decision) => decision.action === 'conflict').length;
-      const paths = decisions.slice(0, 8).map((decision) => `${decision.action}: ${decision.path}`);
-      const remainder = decisions.length > paths.length ? `\n…and ${decisions.length - paths.length} more` : '';
-      const pending = this.pendingUpload === null ? '' : '\nPending upload remains queued.';
-      new Notice(
-        `Own Sync preview at revision ${revision}: ${uploads} uploads, ${downloads} downloads, ${conflicts} conflicts.` +
-        `${paths.length ? `\n${paths.join('\n')}` : ''}${remainder}${pending}\nNo files changed.`,
-        20000,
-      );
-    } catch (error) {
-      new Notice(error instanceof PreviewLimitError
-        ? `Own Sync: ${error.message} No files changed.`
-        : 'Own Sync: preview failed or contains unsupported data. No files changed.');
-    }
-  }
-
-  async uploadTestVault(): Promise<void> {
-    if (this.mutationRunning) return;
-    this.mutationRunning = true;
-    try {
-      await this.uploadTestVaultOnce();
-    } finally {
-      this.mutationRunning = false;
-    }
-  }
-
-  private async uploadTestVaultOnce(): Promise<void> {
-    let connection: { baseUrl: string; vaultId: string; token: string };
-    try {
-      connection = this.vaultConnection();
-    } catch (error) {
-      new Notice(`Own Sync: ${(error as Error).message}`);
-      return;
-    }
-    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
-    const vaultId = connection.vaultId.toLowerCase();
-    const endpoint = `${connection.baseUrl}/api/v0/vaults/${vaultId}`;
-    if (this.pendingDownload !== null) {
-      new Notice('Own Sync: finish the pending test download before uploading.');
-      return;
-    }
-    if (this.pendingPull !== null) {
-      new Notice('Own Sync: finish the pending remote pull before uploading.');
-      return;
-    }
-    if (this.confirmed !== null && this.pendingUpload === null) {
-      new Notice('Own Sync: initial upload is already confirmed. Use Push local test changes.');
-      return;
-    }
-    if (this.pendingUpload === null) {
-      try {
-        const head = await requestUrl({
-          url: `${endpoint}/head`, method: 'GET',
-          headers: { Authorization: `Bearer ${connection.token}` }, throw: false,
-        });
-        if (head.status !== 200 || head.json?.current_revision !== 0) {
-          new Notice('Own Sync: test upload needs an accessible empty server vault. No files sent.');
-          return;
-        }
-        const files = this.app.vault.getFiles().filter((file) => isSyncableVaultPath(file.path));
-        if (files.length === 0) {
-          new Notice('Own Sync: test vault has no visible files to upload.');
-          return;
-        }
-        for (const file of files) validateSyncPath(file.path);
-        assertNoCaseCollisions(files.map((file) => file.path));
-        let totalBytes = 0;
-        const changes: Array<{ path: string; kind: 'put'; bytes: Uint8Array }> = [];
-        for (const file of files) {
-          totalBytes += file.stat.size;
-          if (totalBytes > MAX_PACKET_BYTES) {
-            new Notice('Own Sync: test upload exceeds the 1 MiB packet limit. No files sent.');
-            return;
-          }
-          changes.push({ path: file.path, kind: 'put', bytes: new Uint8Array(await this.app.vault.readBinary(file)) });
-        }
-        const packet = await encodePacket(changes);
-        this.pendingUpload = createPendingUpload(connection.baseUrl, vaultId, packet);
-        this.updateStatus('queued');
-        try {
-          await this.saveSettings();
-        } catch {
-          this.pendingUpload = null;
-          throw new Error('Could not persist pending upload.');
-        }
-      } catch {
-        this.updateStatus('error');
-        new Notice('Own Sync: could not prepare or save test upload. No files sent.');
-        return;
-      }
-    }
-
-    await this.submitPendingUpload(connection);
-  }
-
-  async downloadTestVault(): Promise<void> {
-    if (this.mutationRunning) return;
-    this.mutationRunning = true;
-    try {
-      await this.downloadTestVaultOnce();
-    } finally {
-      this.mutationRunning = false;
-    }
-  }
-
-  private async downloadTestVaultOnce(): Promise<void> {
-    let connection: { baseUrl: string; vaultId: string; token: string };
-    try {
-      connection = this.vaultConnection();
-    } catch (error) {
-      new Notice(`Own Sync: ${(error as Error).message}`);
-      return;
-    }
-    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
-    if (this.pendingUpload !== null) {
-      new Notice('Own Sync: finish the pending test upload before downloading.');
-      return;
-    }
-    if (this.pendingPull !== null) {
-      new Notice('Own Sync: finish the pending remote pull before downloading.');
-      return;
-    }
-    if (this.confirmed !== null && this.pendingDownload === null) {
-      new Notice('Own Sync: this vault already has confirmed state. First download is complete.');
-      return;
-    }
-    const vaultId = connection.vaultId.toLowerCase();
-    const endpoint = `${connection.baseUrl}/api/v0/vaults/${vaultId}`;
-    if (this.pendingDownload === null) {
-      if (this.app.vault.getFiles().some((file) => isSyncableVaultPath(file.path))) {
-        new Notice('Own Sync: first download needs an empty local test vault. No files changed.');
-        return;
-      }
-      try {
-        const headers = { Authorization: `Bearer ${connection.token}` };
-        const head = await requestUrl({ url: `${endpoint}/head`, method: 'GET', headers, throw: false });
-        if (head.status !== 200 || head.json?.current_revision !== 1) {
-          new Notice('Own Sync: first download needs exactly one server revision. No files changed.');
-          return;
-        }
-        const response = await requestUrl({
-          url: `${endpoint}/commits/1`, method: 'GET', headers, throw: false,
-        });
-        if (response.status !== 200) {
-          new Notice(`Own Sync: could not read first revision (HTTP ${response.status}).`);
-          return;
-        }
-        const pending = createPendingDownload(connection.baseUrl, vaultId, response.arrayBuffer);
-        const { changes } = await readPendingDownload(pending);
-        assertNoCaseCollisions(changes.map((change) => change.path));
-        assertNoFileDirectoryCollisions(changes.map((change) => change.path));
-        this.pendingDownload = pending;
-        try {
-          await this.saveSettings();
-        } catch {
-          this.pendingDownload = null;
-          throw new Error('Could not persist pending download.');
-        }
-      } catch {
-        this.updateStatus('error');
-        new Notice('Own Sync: could not prepare or save first download. No files changed.');
-        return;
-      }
-    }
-
-    try {
-      const { pending, changes } = await readPendingDownload(this.pendingDownload);
-      if (pending.serverUrl !== connection.baseUrl || pending.vaultId !== vaultId) {
-        new Notice('Own Sync: pending download belongs to another server or vault. Restore its settings before retrying.');
-        return;
-      }
-      const paths = changes.map((change) => change.path);
-      assertNoCaseCollisions(paths);
-      assertNoFileDirectoryCollisions(paths);
-      const vault = this.app.vault;
-      await applyInitialSnapshot({
-        listPaths: () => vault.getFiles().filter((file) => isSyncableVaultPath(file.path)).map((file) => file.path),
-        read: async (path) => {
-          const file = vault.getAbstractFileByPath(path);
-          if (file === null) return null;
-          if (!(file instanceof TFile)) throw new Error('Folder conflicts with a downloaded file.');
-          return new Uint8Array(await vault.readBinary(file));
-        },
-        ensureFolder: async (path) => {
-          const existing = vault.getAbstractFileByPath(path);
-          if (existing === null) await vault.createFolder(path);
-          else if (!(existing instanceof TFolder)) throw new Error('File conflicts with a downloaded folder.');
-        },
-        create: async (path, bytes) => {
-          await vault.createBinary(path, new Uint8Array(bytes).buffer);
-        },
-      }, changes);
-      const nextConfirmed = await confirmedAfterInitialDownload(pending);
-      const previousConfirmed = this.confirmed;
-      this.pendingDownload = null;
-      this.confirmed = nextConfirmed;
-      try {
-        await this.saveSettings();
-        this.updateStatus('synced');
-        new Notice(`Own Sync: downloaded ${changes.length} test files. Later revisions are not synced.`);
-      } catch {
-        this.pendingDownload = pending;
-        this.confirmed = previousConfirmed;
-        new Notice('Own Sync: files were created, but local confirmation failed. An identical retry is safe.');
-      }
-    } catch {
-      this.updateStatus('error');
-      new Notice('Own Sync: download stopped. Pending packet kept; existing files were not overwritten.');
-    }
-  }
-
-  async pushLocalChanges(): Promise<void> {
-    if (this.mutationRunning) return;
-    this.mutationRunning = true;
-    try {
-      await this.pushLocalChangesOnce();
-    } finally {
-      this.mutationRunning = false;
-    }
-  }
-
-  private async pushLocalChangesOnce(): Promise<void> {
-    let connection: { baseUrl: string; vaultId: string; token: string };
-    try {
-      connection = this.vaultConnection();
-    } catch (error) {
-      this.updateStatus('error');
-      new Notice(`Own Sync: ${(error as Error).message}`);
-      return;
-    }
-    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
-    if (this.pendingDownload !== null) {
-      new Notice('Own Sync: finish the pending test download before pushing changes.');
-      return;
-    }
-    if (this.pendingPull !== null) {
-      this.updateStatus('queued');
-      new Notice('Own Sync: finish the pending remote pull before pushing changes.');
-      return;
-    }
-    if (this.pendingUpload !== null) {
-      await this.submitPendingUpload(connection);
-      return;
-    }
-
-    let confirmed: ReturnType<typeof readConfirmedState>;
-    try {
-      confirmed = readConfirmedState(this.confirmed);
-      if (confirmed.state.serverUrl !== connection.baseUrl ||
-        confirmed.state.vaultId !== connection.vaultId.toLowerCase()) {
-        throw new Error('Confirmed state belongs to another server or vault.');
-      }
-    } catch {
-      this.updateStatus('error');
-      new Notice('Own Sync: no valid confirmed base for this vault. Complete the first test transfer.');
-      return;
-    }
-
-    const endpoint = `${connection.baseUrl}/api/v0/vaults/${confirmed.state.vaultId}`;
-    try {
-      const head = await requestUrl({
-        url: `${endpoint}/head`, method: 'GET',
-        headers: { Authorization: `Bearer ${connection.token}` }, throw: false,
-      });
-      if (head.status !== 200 || head.json?.current_revision !== confirmed.state.revision) {
-        this.updateStatus(head.status === 200 ? 'conflict' : 'error');
-        new Notice('Own Sync: server revision differs from the confirmed base. Local files were not sent.');
-        return;
-      }
-      const local = new Map<string, { digest: string; bytes: Uint8Array }>();
-      let scannedBytes = 0;
-      for (const file of this.app.vault.getFiles().filter((file) => isSyncableVaultPath(file.path))) {
-        validateSyncPath(file.path);
-        scannedBytes += file.stat.size;
-        if (scannedBytes > MAX_PREVIEW_BYTES) {
-          this.updateStatus('error');
-          new Notice('Own Sync: local test vault exceeds the 32 MiB scan limit. No files sent.');
-          return;
-        }
-        const bytes = new Uint8Array(await this.app.vault.readBinary(file));
-        scannedBytes += bytes.byteLength - file.stat.size;
-        if (scannedBytes > MAX_PREVIEW_BYTES) {
-          this.updateStatus('error');
-          new Notice('Own Sync: local test vault exceeds the 32 MiB scan limit. No files sent.');
-          return;
-        }
-        local.set(file.path, { digest: await digestBytes(bytes), bytes });
-      }
-      assertNoCaseCollisions(new Set([...confirmed.digests.keys(), ...local.keys()]));
-      assertNoFileDirectoryCollisions(local.keys());
-      const changes = changesFromLocal(confirmed.digests, local);
-      if (changes.length === 0) {
-        new Notice(`Own Sync: local files match confirmed revision ${confirmed.state.revision}.`);
-        return;
-      }
-      const packet = await encodePacket(changes);
-      this.pendingUpload = createPendingUpload(
-        connection.baseUrl, confirmed.state.vaultId, packet, confirmed.state.revision,
-      );
-      this.updateStatus('queued');
-      try {
-        await this.saveSettings();
-      } catch {
-        this.pendingUpload = null;
-        throw new Error('Could not persist pending changes.');
-      }
-    } catch {
-      this.updateStatus('error');
-      new Notice('Own Sync: could not prepare or save local changes. No new request sent.');
-      return;
-    }
-    await this.submitPendingUpload(connection);
-  }
-
-  private async submitPendingUpload(
-    connection: { baseUrl: string; vaultId: string; token: string }, quietConflict = false,
-  ): Promise<'confirmed' | 'conflict' | 'blocked'> {
-    let pending: Awaited<ReturnType<typeof readPendingUpload>>['pending'];
-    let body: ArrayBuffer;
-    let nextConfirmed: Awaited<ReturnType<typeof confirmedAfterUpload>>;
-    try {
-      ({ pending, body } = await readPendingUpload(this.pendingUpload));
-      if (pending.serverUrl !== connection.baseUrl || pending.vaultId !== connection.vaultId.toLowerCase()) {
-        this.updateStatus('error');
-        new Notice('Own Sync: pending upload belongs to another server or vault. Restore its settings before retrying.');
-        return 'blocked';
-      }
-      nextConfirmed = await confirmedAfterUpload(this.confirmed, pending);
-    } catch {
-      this.updateStatus('error');
-      new Notice('Own Sync: pending upload or confirmed base is invalid. No request sent.');
-      return 'blocked';
-    }
-
-    const expectedRevision = pending.expectedRevision ?? 0;
-    const endpoint = `${connection.baseUrl}/api/v0/vaults/${pending.vaultId}`;
-    try {
-      const response = await requestUrl({
-        url: `${endpoint}/operations/${pending.operationId}`,
-        method: 'POST',
-        contentType: 'application/octet-stream',
-        headers: {
-          Authorization: `Bearer ${connection.token}`,
-          'X-Expected-Revision': String(expectedRevision),
-        },
-        body,
-        throw: false,
-      });
-      const result = classifyUploadResponse(response.status, response.json, expectedRevision);
-      if (result === 'applied' || result === 'replayed') {
-        const previousConfirmed = this.confirmed;
-        this.confirmed = nextConfirmed;
-        this.pendingUpload = null;
-        try {
-          await this.saveSettings();
-          new Notice(`Own Sync: test changes confirmed at revision ${nextConfirmed.revision}.`);
-          this.updateStatus('synced');
-          return 'confirmed';
-        } catch {
-          this.confirmed = previousConfirmed;
-          this.pendingUpload = pending;
-          new Notice('Own Sync: server accepted changes, but local confirmation failed. Retry is safe.');
-          this.updateStatus('error');
-          return 'blocked';
-        }
-      } else if (result === 'conflict') {
-        if (!quietConflict) {
-          new Notice('Own Sync: server changed during upload. Pending operation kept; reconciliation is required.');
-        }
-        this.updateStatus('conflict');
-        return 'conflict';
-      } else {
-        new Notice(`Own Sync: server did not accept changes (HTTP ${response.status}). Pending operation kept.`);
-        this.updateStatus('error');
-        return 'blocked';
-      }
-    } catch {
-      new Notice('Own Sync: upload result unknown. Pending operation kept for an identical retry.');
-      this.updateStatus('error');
-      return 'blocked';
-    }
-  }
-
-  async pullRemoteChanges(): Promise<void> {
-    if (this.mutationRunning) return;
-    this.mutationRunning = true;
-    try {
-      await this.pullRemoteChangesOnce();
-    } finally {
-      this.mutationRunning = false;
-    }
-  }
-
-  async reconcilePendingUpload(): Promise<void> {
-    if (this.mutationRunning) return;
-    this.mutationRunning = true;
-    try {
-      await this.reconcilePendingUploadOnce();
-    } finally {
-      this.mutationRunning = false;
-    }
-  }
-
-  private async reconcilePendingUploadOnce(): Promise<void> {
-    let connection: { baseUrl: string; vaultId: string; token: string };
-    try {
-      connection = this.vaultConnection();
-    } catch (error) {
-      this.updateStatus('error');
-      new Notice(`Own Sync: ${(error as Error).message}`);
-      return;
-    }
-    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
-    if (this.pendingDownload !== null || this.pendingUpload === null) {
-      this.updateStatus('queued');
-      new Notice('Own Sync: reconciliation needs a pending test upload and no first download.');
-      return;
-    }
-    if (this.pendingPull !== null) {
-      try {
-        const { pending } = await readPendingPull(this.pendingPull);
-        if (pending.rebaseOperationId === undefined) throw new Error('Not a pending rebase.');
-        await this.pullRemoteChangesOnce(pending.rebaseOperationId);
-      } catch {
-        this.updateStatus('error');
-        new Notice('Own Sync: saved reconciliation is invalid. Pending operations were kept.');
-      }
-      return;
-    }
-    let operationId: string;
-    try {
-      const { pending } = await readPendingUpload(this.pendingUpload);
-      const confirmed = readConfirmedState(this.confirmed);
-      if (pending.serverUrl !== connection.baseUrl || pending.vaultId !== connection.vaultId.toLowerCase() ||
-        (pending.expectedRevision ?? 0) !== confirmed.state.revision) {
-        throw new Error('Pending upload does not match the confirmed vault.');
-      }
-      operationId = pending.operationId;
-    } catch {
-      this.updateStatus('error');
-      new Notice('Own Sync: pending upload has no valid confirmed base for reconciliation.');
-      return;
-    }
-    if (await this.submitPendingUpload(connection, true) === 'conflict') {
-      await this.pullRemoteChangesOnce(operationId);
-    }
-  }
-
-  private async scanLocalDigests(): Promise<Map<string, string>> {
-    const local = new Map<string, string>();
-    let scannedBytes = 0;
-    for (const file of this.app.vault.getFiles().filter((file) => isSyncableVaultPath(file.path))) {
-      validateSyncPath(file.path);
-      scannedBytes += file.stat.size;
-      if (scannedBytes > MAX_PREVIEW_BYTES) throw new PreviewLimitError('Local vault exceeds 32 MiB.');
-      const bytes = new Uint8Array(await this.app.vault.readBinary(file));
-      scannedBytes += bytes.byteLength - file.stat.size;
-      if (scannedBytes > MAX_PREVIEW_BYTES) throw new PreviewLimitError('Local vault exceeds 32 MiB.');
-      local.set(file.path, await digestBytes(bytes));
-    }
-    return local;
-  }
-
-  private async pullRemoteChangesOnce(rebaseOperationId?: string): Promise<void> {
-    let connection: { baseUrl: string; vaultId: string; token: string };
-    let confirmed: ReturnType<typeof readConfirmedState>;
-    try {
-      connection = this.vaultConnection();
-      confirmed = readConfirmedState(this.confirmed);
-      if (confirmed.state.serverUrl !== connection.baseUrl ||
-        confirmed.state.vaultId !== connection.vaultId.toLowerCase()) {
-        throw new Error('Confirmed state belongs to another server or vault.');
-      }
-    } catch {
-      this.updateStatus('setup');
-      new Notice('Own Sync: no confirmed base for this vault. Complete the first test transfer.');
-      return;
-    }
-    if (!await this.requireServerCapabilities(connection.baseUrl)) return;
-    if (this.pendingDownload !== null ||
-      (rebaseOperationId === undefined && this.pendingUpload !== null) ||
-      (rebaseOperationId !== undefined && this.pendingUpload === null)) {
-      this.updateStatus('queued');
-      new Notice('Own Sync: finish the pending upload or first download before pulling changes.');
-      return;
-    }
-
-    if (this.pendingPull === null) {
-      const endpoint = `${connection.baseUrl}/api/v0/vaults/${confirmed.state.vaultId}`;
-      const headers = { Authorization: `Bearer ${connection.token}` };
-      try {
-        const head = await requestUrl({ url: `${endpoint}/head`, method: 'GET', headers, throw: false });
-        if (head.status !== 200 || !Number.isSafeInteger(head.json?.current_revision) ||
-          head.json.current_revision < confirmed.state.revision) {
-          this.updateStatus('error');
-          throw new Error('Invalid remote head.');
-        }
-        const revision: number = head.json.current_revision;
-        if (revision === confirmed.state.revision) {
-          this.updateStatus('synced');
-          new Notice(`Own Sync: already at confirmed revision ${revision}.`);
-          return;
-        }
-        if (revision - confirmed.state.revision > MAX_PREVIEW_REVISIONS) {
-          throw new PreviewLimitError('More than 100 remote revisions.');
-        }
-
-        const local = await this.scanLocalDigests();
-        if (rebaseOperationId !== undefined) {
-          const { pending } = await readPendingUpload(this.pendingUpload);
-          if (pending.operationId !== rebaseOperationId ||
-            (pending.expectedRevision ?? 0) !== confirmed.state.revision) {
-            throw new Error('Pending upload does not match the confirmed base.');
-          }
-          try {
-            await queuedUploadDigests(this.confirmed, pending, local);
-          } catch {
-            this.updateStatus('conflict');
-            new Notice('Own Sync: local files changed after the queued upload. Pending upload kept; no rebase started.');
-            return;
-          }
-        }
-        const remote = new Map(confirmed.digests);
-        const remoteBytes = new Map<string, Uint8Array>();
-        let transferredBytes = 0;
-        for (let current = confirmed.state.revision + 1; current <= revision; current += 1) {
-          const response = await requestUrl({
-            url: `${endpoint}/commits/${current}`, method: 'GET', headers, throw: false,
-          });
-          if (response.status !== 200) throw new Error('Could not read a remote commit.');
-          transferredBytes += response.arrayBuffer.byteLength;
-          if (transferredBytes > MAX_PREVIEW_BYTES) {
-            throw new PreviewLimitError('Remote delta exceeds 32 MiB.');
-          }
-          const changes = await decodePacket(response.arrayBuffer);
-          await applyPacketToDigests(remote, response.arrayBuffer);
-          for (const change of changes) {
-            if (change.kind === 'put') remoteBytes.set(change.path, change.bytes);
-            else remoteBytes.delete(change.path);
-          }
-        }
-        assertNoCaseCollisions(remote.keys());
-        assertNoFileDirectoryCollisions(remote.keys());
-        const decisions = planFromConfirmed(confirmed.digests, local, remote);
-        if (decisions.some((decision) => decision.action === 'conflict')) {
-          this.updateStatus('conflict');
-          new Notice('Own Sync: local and remote files conflict. Pull stopped; preview changes first.');
-          return;
-        }
-        const delta: FileChange[] = [];
-        for (const path of new Set([...confirmed.digests.keys(), ...remote.keys()])) {
-          if (confirmed.digests.get(path) === remote.get(path)) continue;
-          const digest = remote.get(path);
-          if (digest === undefined) delta.push({ path, kind: 'delete' });
-          else {
-            const bytes = remoteBytes.get(path);
-            if (bytes === undefined || await digestBytes(bytes) !== digest) {
-              throw new Error('Remote packet history is incomplete.');
-            }
-            delta.push({ path, kind: 'put', bytes });
-          }
-        }
-        if (delta.length === 0) {
-          const previousConfirmed = this.confirmed;
-          const previousUpload = this.pendingUpload;
-          if (rebaseOperationId !== undefined) {
-            const current = await this.scanLocalDigests();
-            try {
-              await queuedUploadDigests(this.confirmed, previousUpload, current);
-            } catch {
-              this.updateStatus('conflict');
-              new Notice('Own Sync: local files changed during rebase. Pending upload kept.');
-              return;
-            }
-          }
-          const nextConfirmed = advanceConfirmedRevision(previousConfirmed, revision);
-          this.confirmed = nextConfirmed;
-          if (rebaseOperationId !== undefined) this.pendingUpload = null;
-          try {
-            await this.saveSettings();
-          } catch {
-            this.confirmed = previousConfirmed;
-            this.pendingUpload = previousUpload;
-            this.updateStatus('error');
-            new Notice('Own Sync: could not save the confirmed revision. Files were not changed.');
-            return;
-          }
-          this.updateStatus('synced');
-          new Notice(`Own Sync: confirmed revision ${revision}; file contents already match.`);
-          if (rebaseOperationId !== undefined) {
-            try { await this.pushLocalChangesOnce(); }
-            catch { new Notice('Own Sync: rebase saved. Retry Push local changes to send remaining edits.'); }
-          }
-          return;
-        }
-        const packet = await encodePacket(delta);
-        this.pendingPull = createPendingPull(
-          connection.baseUrl, confirmed.state.vaultId, confirmed.state.revision, revision, packet,
-          rebaseOperationId,
-        );
-        try {
-          await this.saveSettings();
-        } catch {
-          this.pendingPull = null;
-          throw new Error('Could not save pending remote changes.');
-        }
-      } catch (error) {
-        this.updateStatus('error');
-        new Notice(error instanceof PreviewLimitError
-          ? `Own Sync: ${error.message} No files changed.`
-          : 'Own Sync: could not prepare the remote pull. No files changed.');
-        return;
-      }
-    }
-
-    try {
-      const { pending, changes } = await readPendingPull(this.pendingPull);
-      if (pending.serverUrl !== connection.baseUrl || pending.vaultId !== confirmed.state.vaultId) {
-        this.updateStatus('error');
-        new Notice('Own Sync: pending pull belongs to another server or vault. Restore its settings before retrying.');
-        return;
-      }
-      if (pending.rebaseOperationId !== rebaseOperationId) {
-        this.updateStatus('error');
-        new Notice('Own Sync: pending pull belongs to a different operation. Use the matching retry command.');
-        return;
-      }
-      const nextConfirmed = await confirmedAfterPull(this.confirmed, pending);
-      let rebaseState: {
-        desired: Map<string, string>;
-        remote: Map<string, string>;
-        decisions: ReturnType<typeof planFromConfirmed>;
-      } | null = null;
-      if (pending.rebaseOperationId !== undefined) {
-        const { pending: upload } = await readPendingUpload(this.pendingUpload);
-        if (upload.operationId !== pending.rebaseOperationId ||
-          (upload.expectedRevision ?? 0) !== confirmed.state.revision) {
-          throw new Error('Queued upload no longer matches the pending rebase.');
-        }
-        const desired = readConfirmedState(await confirmedAfterUpload(this.confirmed, upload)).digests;
-        const remote = readConfirmedState(nextConfirmed).digests;
-        const decisions = planFromConfirmed(confirmed.digests, desired, remote);
-        assertRebaseLocalFiles(desired, remote, decisions, changes, await this.scanLocalDigests(), true);
-        rebaseState = { desired, remote, decisions };
-      }
-      const vault = this.app.vault;
-      await applyRemoteChanges({
-        listPaths: () => vault.getFiles().filter((file) => isSyncableVaultPath(file.path)).map((file) => file.path),
-        read: async (path) => {
-          const file = vault.getAbstractFileByPath(path);
-          if (file === null) return null;
-          if (file instanceof TFolder) return null;
-          if (!(file instanceof TFile)) throw new Error('Unsupported vault entry.');
-          return new Uint8Array(await vault.readBinary(file));
-        },
-        ensureFolder: async (path) => {
-          const existing = vault.getAbstractFileByPath(path);
-          if (existing === null) await vault.createFolder(path);
-          else if (!(existing instanceof TFolder)) throw new Error('File conflicts with a remote folder.');
-        },
-        put: async (path, bytes) => {
-          const existing = vault.getAbstractFileByPath(path);
-          const data = new Uint8Array(bytes).buffer;
-          if (existing === null) await vault.createBinary(path, data);
-          else if (existing instanceof TFile) await vault.modifyBinary(existing, data);
-          else throw new Error('Folder conflicts with a remote file.');
-        },
-        remove: async (path) => {
-          const existing = vault.getAbstractFileByPath(path);
-          if (existing === null) return;
-          if (!(existing instanceof TFile)) throw new Error('Folder conflicts with a remote deletion.');
-          await this.app.fileManager.trashFile(existing);
-        },
-      }, confirmed.digests, changes);
-      if (rebaseState !== null) {
-        assertRebaseLocalFiles(rebaseState.desired, rebaseState.remote, rebaseState.decisions,
-          changes, await this.scanLocalDigests(), false);
-      }
-      const previousConfirmed = this.confirmed;
-      const previousUpload = this.pendingUpload;
-      this.confirmed = nextConfirmed;
-      this.pendingPull = null;
-      if (pending.rebaseOperationId !== undefined) this.pendingUpload = null;
-      try {
-        await this.saveSettings();
-      } catch {
-        this.confirmed = previousConfirmed;
-        this.pendingPull = pending;
-        this.pendingUpload = previousUpload;
-        this.updateStatus('error');
-        new Notice('Own Sync: files changed, but confirmation could not be saved. Retry the pull.');
-        return;
-      }
-      if (this.pendingUpload === null) this.updateStatus('synced');
-      new Notice(`Own Sync: pulled test changes through revision ${nextConfirmed.revision}.`);
-      if (pending.rebaseOperationId !== undefined) {
-        try { await this.pushLocalChangesOnce(); }
-        catch { new Notice('Own Sync: rebase saved. Retry Push local changes to send remaining edits.'); }
-      }
-    } catch {
-      this.updateStatus('error');
-      new Notice('Own Sync: remote pull stopped. Pending packet kept; retry after checking local files.');
-    }
-  }
 }
 
 class OwnSyncSettingTab extends PluginSettingTab {
-  constructor(app: App, private readonly plugin: OwnSyncPlugin) {
+  private readonly plugin: OwnSyncPlugin;
+
+  constructor(app: App, plugin: OwnSyncPlugin) {
     super(app, plugin);
+    this.plugin = plugin;
   }
 
   display(): void {
@@ -1198,7 +437,7 @@ class OwnSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Server URL')
-      .setDesc('Address of your own server. This development build supports only manual, unencrypted test transfers.')
+      .setDesc('Address of your own server. This development build sends files unencrypted; use disposable test vaults only.')
       .addText((text) => text
         .setPlaceholder('https://sync.example.com')
         .setValue(this.plugin.settings.serverUrl)
@@ -1209,7 +448,7 @@ class OwnSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Vault ID')
-      .setDesc('The vault_id from the local server bootstrap file.')
+      .setDesc('The vault_id from the server credentials file.')
       .addText((text) => text
         .setPlaceholder('32 hexadecimal characters')
         .setValue(this.plugin.settings.vaultId)
@@ -1220,7 +459,7 @@ class OwnSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Device token')
-      .setDesc('Select a secret containing the token from the local server bootstrap file. The plugin saves only the secret name in its settings.')
+      .setDesc('Select a secret containing the token from the server credentials file. The plugin saves only the secret name in its settings.')
       .addComponent((element) => new SecretComponent(this.app, element)
         .setValue(this.plugin.settings.tokenSecretId)
         .onChange(async (value) => {
@@ -1229,8 +468,8 @@ class OwnSyncSettingTab extends PluginSettingTab {
         }));
 
     new Setting(containerEl)
-      .setName('Automatic test sync')
-      .setDesc('After the first confirmed transfer, sync on vault changes, app return and network return. Transfers are unencrypted; use only disposable test vaults.')
+      .setName('Automatic sync')
+      .setDesc('Sync after vault changes, when the app returns, when the network returns and every 30 seconds. Files that exist on both sides with different contents are kept as conflict copies.')
       .addToggle((toggle) => toggle
         .setValue(this.plugin.settings.automaticSync)
         .onChange(async (value) => {
@@ -1263,74 +502,11 @@ class OwnSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Vault access')
-      .setDesc('Check the token and vault ID against the experimental server API. No notes are transferred.')
+      .setDesc('Check the token and vault ID against the server. No notes are transferred.')
       .addButton((button) => button
         .setButtonText('Check vault access')
         .onClick(async () => {
           await this.plugin.checkVaultAccess();
-        }));
-
-    new Setting(containerEl)
-      .setName('First sync preview')
-      .setDesc('Read the test server history and local files, then count proposed changes. This does not write files or send notes.')
-      .addButton((button) => button
-        .setButtonText('Preview first sync')
-        .onClick(async () => {
-          await this.plugin.previewFirstSync();
-        }));
-
-    new Setting(containerEl)
-      .setName('Changes since confirmed revision')
-      .setDesc('Compare local files with only the later server revisions and list proposed uploads, downloads and conflicts. Reads only; pending uploads remain queued.')
-      .addButton((button) => button
-        .setButtonText('Preview changes')
-        .onClick(async () => {
-          await this.plugin.previewConfirmedChanges();
-        }));
-
-    new Setting(containerEl)
-      .setName('Test upload')
-      .setDesc('Send all visible files as one unencrypted packet only if the server vault is empty. For disposable test data. A failed request keeps the exact packet for retry.')
-      .addButton((button) => button
-        .setButtonText('Upload test vault')
-        .onClick(async () => {
-          await this.plugin.uploadTestVault();
-        }));
-
-    new Setting(containerEl)
-      .setName('First test download')
-      .setDesc('Create files from server revision 1 in an empty disposable vault. Never overwrites an existing file; a partial download can be retried.')
-      .addButton((button) => button
-        .setButtonText('Download test vault')
-        .onClick(async () => {
-          await this.plugin.downloadTestVault();
-        }));
-
-    new Setting(containerEl)
-      .setName('Push local test changes')
-      .setDesc('After the first transfer, send local additions, edits and deletions only when the server revision still matches. This is a manual unencrypted test operation.')
-      .addButton((button) => button
-        .setButtonText('Push local changes')
-        .onClick(async () => {
-          await this.plugin.pushLocalChanges();
-        }));
-
-    new Setting(containerEl)
-      .setName('Pull remote test changes')
-      .setDesc('Apply later server changes while preserving independent local edits. Conflicting paths stop the pull. Deleted files follow your Obsidian trash preference; interrupted pulls can be retried.')
-      .addButton((button) => button
-        .setButtonText('Pull remote changes')
-        .onClick(async () => {
-          await this.plugin.pullRemoteChanges();
-        }));
-
-    new Setting(containerEl)
-      .setName('Reconcile pending test upload')
-      .setDesc('Retry a queued upload, then rebase it only if the server explicitly rejects the old revision and the local files still match the queued packet. Conflicting paths stay queued.')
-      .addButton((button) => button
-        .setButtonText('Reconcile upload')
-        .onClick(async () => {
-          await this.plugin.reconcilePendingUpload();
         }));
   }
 }
